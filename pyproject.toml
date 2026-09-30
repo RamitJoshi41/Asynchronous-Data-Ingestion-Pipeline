@@ -1,0 +1,31 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ingest"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "requests==2.32.3"
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-asyncio",
+    "mypy",
+    "ruff"
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ingest"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+
+[tool.mypy]
+strict = true
+
+[tool.ruff.lint]
+extend-select = ["I"]
