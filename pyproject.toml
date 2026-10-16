@@ -6,9 +6,15 @@ build-backend = "hatchling.build"
 name = "ingest"
 version = "0.1.0"
 requires-python = ">=3.12"
-dependencies = []
+# Runtime deps are added in the phase that first imports them (ADR-0004).
+dependencies = [
+    "pydantic>=2.13.5",
+    "pydantic-settings>=2.15.0",
+    "structlog>=26.1.0",
+]
 
-[project.optional-dependencies]
+# A dependency group (not an optional extra) so plain `uv sync` installs the dev tools.
+[dependency-groups]
 dev = [
     "pytest==9.0.3",
     "pytest-asyncio==1.4.0",
@@ -27,6 +33,10 @@ asyncio_default_fixture_loop_scope = "function"
 [tool.mypy]
 strict = true
 python_version = "3.12"
+files = ["src", "tests"]
+mypy_path = "src"
+# Teaches mypy pydantic's real __init__ signatures, e.g. BaseSettings(_env_file=...).
+plugins = ["pydantic.mypy"]
 
 [tool.ruff]
 target-version = "py312"
