@@ -42,20 +42,36 @@ def test_settings() -> Settings:
 
 
 @pytest.fixture
-async def pool(test_settings: Settings) -> AsyncIterator[DbPool]:
+async def schema(test_settings: Settings) -> AsyncIterator[str]:
     """An empty schema of its own: tests can't see each other's tables or rows."""
-    schema = f"t_{uuid.uuid4().hex[:12]}"
+    name = f"t_{uuid.uuid4().hex[:12]}"
     admin = await asyncpg.connect(TEST_DB_DSN, timeout=5)
     try:
-        await admin.execute(f'CREATE SCHEMA "{schema}"')
-        db_pool = await create_pool(test_settings, search_path=schema)
-        try:
-            yield db_pool
-        finally:
-            await db_pool.close()
-        await admin.execute(f'DROP SCHEMA "{schema}" CASCADE')
+        await admin.execute(f'CREATE SCHEMA "{name}"')
+        yield name
+        await admin.execute(f'DROP SCHEMA "{name}" CASCADE')
     finally:
         await admin.close()
+
+
+@pytest.fixture
+def schema_settings(test_settings: Settings, schema: str) -> Settings:
+    """Settings whose DSN itself selects the test schema, for code that builds its own pool (CLI).
+
+    asyncpg passes unknown DSN query parameters through as server settings.
+    """
+    return test_settings.model_copy(
+        update={"db_dsn": SecretStr(f"{TEST_DB_DSN}?search_path={schema}")}
+    )
+
+
+@pytest.fixture
+async def pool(test_settings: Settings, schema: str) -> AsyncIterator[DbPool]:
+    db_pool = await create_pool(test_settings, search_path=schema)
+    try:
+        yield db_pool
+    finally:
+        await db_pool.close()  # before the schema fixture drops the schema
 
 
 @pytest.fixture
