@@ -1,6 +1,7 @@
 from collections.abc import Iterator
 
 import pytest
+from pydantic import ValidationError
 
 from ingest.config import Settings, get_settings
 
@@ -48,3 +49,31 @@ def test_secrets_are_masked_in_repr(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_get_settings_is_cached() -> None:
     assert get_settings() is get_settings()
+
+
+def test_default_dsn_targets_compose_db_port() -> None:
+    assert ":5433/" in Settings(_env_file=None).db_dsn.get_secret_value()
+
+
+@pytest.mark.parametrize(
+    ("field", "bad_value"),
+    [
+        ("HN_TOP_LIMIT", "0"),
+        ("HN_TOP_LIMIT", "501"),  # /topstories returns at most 500 ids
+        ("DB_POOL_MAX_SIZE", "0"),
+        ("HTTP_READ_TIMEOUT_S", "0"),
+        ("DB_COMMAND_TIMEOUT_S", "-1"),
+    ],
+)
+def test_out_of_range_values_fail_at_startup(
+    monkeypatch: pytest.MonkeyPatch, field: str, bad_value: str
+) -> None:
+    monkeypatch.setenv(field, bad_value)
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None)
+
+
+def test_numeric_env_strings_are_converted(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Env vars are always strings; settings fields are lax so "45" becomes 45.
+    monkeypatch.setenv("HN_TOP_LIMIT", "45")
+    assert Settings(_env_file=None).hn_top_limit == 45
