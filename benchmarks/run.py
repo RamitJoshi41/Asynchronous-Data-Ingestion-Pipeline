@@ -1,7 +1,9 @@
-"""Benchmark harness skeleton (Phase 1: sequential HN baseline). ADR-0012.
+"""Benchmark harness: sequential vs concurrent HN ingestion. ADR-0012.
 
-    uv run python -m benchmarks.run --target mock --items 100 --latency-ms 50
-    uv run python -m benchmarks.run --target real --items 30
+    uv run python -m benchmarks.run --target mock --items 200 --latency-ms 50 --mode sequential
+    uv run python -m benchmarks.run --target mock --items 200 --latency-ms 50 --mode concurrent \
+        --concurrency 20
+    uv run python -m benchmarks.run --target real --items 30 --mode concurrent --concurrency 5
 
 Each repeat ingests into a FRESH throwaway schema in the dev database (so every repeat measures
 the same cold-insert path and mock data never mixes with real data), then drops it. Results are
@@ -18,6 +20,7 @@ import socket
 import statistics
 import subprocess
 import sys
+import time
 import uuid
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
@@ -31,9 +34,12 @@ from ingest.__main__ import migrate_command
 from ingest.config import Settings, get_settings
 from ingest.db import create_pool
 from ingest.httpclient import build_http_client
-from ingest.sequential import run_hn_sequential
+from ingest.pipeline import ConcurrentRunSummary, PipelineConfig, run_hn_concurrent, settings_for
+from ingest.sequential import RunSummary, run_hn_sequential
 from ingest.storage import Store
 
+PHASE = 2  # the phase that produced new result files
+REAL_MAX_ITEMS, REAL_MAX_CONCURRENCY = 30, 10  # politeness caps for the real API
 RESULTS_DIR = Path(__file__).resolve().parent.parent / "docs" / "benchmarks" / "results"
 
 
@@ -46,6 +52,11 @@ class RepeatResult:
     missing: int
     failed: bool
     error: str | None
+    # CPU time of THIS process during the run: tells "we're CPU-bound" from "we're waiting".
+    client_cpu_s: float = 0.0
+    peak_in_flight: int = 0
+    blocked_puts: int = 0
+    flushes: int = 0
 
     @property
     def items_per_s(self) -> float:
@@ -131,7 +142,10 @@ async def stop_mock(proc: asyncio.subprocess.Process) -> None:
         await proc.wait()
 
 
-async def one_repeat(settings: Settings, base_url: str, items: int) -> RepeatResult:
+async def one_repeat(
+    settings: Settings, base_url: str, items: int, cfg: PipelineConfig | None
+) -> RepeatResult:
+    """One run into a fresh schema. `cfg=None` means the sequential baseline."""
     base_dsn = settings.db_dsn.get_secret_value()
     schema = f"bench_{uuid.uuid4().hex[:10]}"
     admin = await asyncpg.connect(base_dsn, timeout=settings.db_connect_timeout_s)
@@ -140,26 +154,53 @@ async def one_repeat(settings: Settings, base_url: str, items: int) -> RepeatRes
         scoped = settings.model_copy(
             update={"db_dsn": SecretStr(f"{base_dsn}?search_path={schema}")}
         )
+        if cfg is not None:
+            scoped = settings_for(scoped, cfg)  # httpx limits + pool size follow the config
         await migrate_command(scoped)
         pool = await create_pool(scoped)
         try:
             async with build_http_client(scoped) as client:
                 store = Store(pool, acquire_timeout=scoped.db_acquire_timeout_s)
+                cpu_before = time.process_time()
                 try:
-                    s = await run_hn_sequential(store, client, base_url=base_url, limit=items)
+                    s: RunSummary
+                    if cfg is None:
+                        s = await run_hn_sequential(store, client, base_url=base_url, limit=items)
+                    else:
+                        s = await run_hn_concurrent(
+                            store, client, base_url=base_url, limit=items, cfg=cfg
+                        )
                 except Exception as exc:  # a failed run is a data point, not a crash
                     return RepeatResult(0.0, items, 0, 0, 0, True, repr(exc)[:300])
+                cpu = time.process_time() - cpu_before
         finally:
             await pool.close()
         c = s.counts
-        ingested = c.inserted + c.updated + c.unchanged
-        return RepeatResult(s.duration_s, items, ingested, c.invalid, c.missing, False, None)
+        stats = s.stats if isinstance(s, ConcurrentRunSummary) else None
+        return RepeatResult(
+            duration_s=s.duration_s,
+            items_requested=items,
+            ingested=c.inserted + c.updated + c.unchanged,
+            invalid=c.invalid,
+            missing=c.missing,
+            failed=False,
+            error=None,
+            client_cpu_s=cpu,
+            peak_in_flight=stats.peak_in_flight if stats else 1,
+            blocked_puts=stats.blocked_puts if stats else 0,
+            flushes=stats.flushes if stats else c.inserted + c.updated + c.unchanged,
+        )
     finally:
         await admin.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
         await admin.close()
 
 
 async def run_benchmark(args: argparse.Namespace, settings: Settings) -> list[RepeatResult]:
+    cfg = None
+    if args.mode == "concurrent":
+        cfg = PipelineConfig.from_settings(
+            settings, concurrency=args.concurrency, workers=args.workers, batch_size=args.batch_size
+        )
     proc = None
     if args.target == "mock":
         port = free_port()
@@ -170,7 +211,7 @@ async def run_benchmark(args: argparse.Namespace, settings: Settings) -> list[Re
     try:
         results = []
         for i in range(args.repeats):
-            result = await one_repeat(settings, base_url, args.items)
+            result = await one_repeat(settings, base_url, args.items, cfg)
             print(f"repeat {i + 1}/{args.repeats}: {result}")
             results.append(result)
         return results
@@ -180,32 +221,51 @@ async def run_benchmark(args: argparse.Namespace, settings: Settings) -> list[Re
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Phase 1 sequential HN benchmark.")
+    parser = argparse.ArgumentParser(description="HN ingestion benchmark (sequential/concurrent).")
     parser.add_argument("--target", choices=["mock", "real"], required=True)
+    parser.add_argument("--mode", choices=["sequential", "concurrent"], default="sequential")
+    parser.add_argument("--concurrency", type=int, help="concurrent mode (FETCH_CONCURRENCY)")
+    parser.add_argument("--workers", type=int, help="concurrent mode (PIPELINE_WORKERS)")
+    parser.add_argument("--batch-size", type=int, help="concurrent mode (BATCH_SIZE)")
     parser.add_argument("--items", type=int, default=100)
     parser.add_argument("--latency-ms", type=float, default=50.0, help="mock only")
     parser.add_argument("--repeats", type=int, default=None, help="default: 3 mock, 1 real")
     args = parser.parse_args()
     if args.repeats is None:
         args.repeats = 3 if args.target == "mock" else 1
-    if args.target == "real" and (args.items > 30 or args.repeats > 1):
-        parser.error("real-API runs are capped at --items 30 --repeats 1 (be polite to HN)")
+    if args.target == "real" and (args.items > REAL_MAX_ITEMS or args.repeats > 1):
+        parser.error(
+            f"real-API runs are capped at --items {REAL_MAX_ITEMS} --repeats 1 (be polite)"
+        )
+    if args.target == "real" and (args.concurrency or 0) > REAL_MAX_CONCURRENCY:
+        parser.error(f"real-API runs are capped at --concurrency {REAL_MAX_CONCURRENCY}")
+    if args.mode == "sequential" and (args.concurrency or args.workers or args.batch_size):
+        parser.error("--concurrency/--workers/--batch-size only apply to --mode concurrent")
 
     # Sync work (git, /proc reads) happens before the event loop starts.
     started_at = datetime.now(UTC)
     meta = {"machine": machine_info(), **git_commit()}
     repeats = asyncio.run(run_benchmark(args, get_settings()))
 
+    settings = get_settings()
     params: dict[str, object] = {
         "target": args.target,
+        "mode": args.mode,
         "items": args.items,
         "repeats": args.repeats,
     }
     if args.target == "mock":
         params["latency_ms"] = args.latency_ms
+    if args.mode == "concurrent":
+        cfg = PipelineConfig.from_settings(
+            settings, concurrency=args.concurrency, workers=args.workers, batch_size=args.batch_size
+        )
+        params |= {"concurrency": cfg.concurrency, "workers": cfg.workers}
+        params |= {"batch_size": cfg.batch_size, "flush_interval_s": cfg.flush_interval_s}
+        params |= {"raw_queue_maxsize": cfg.raw_queue_maxsize}
     result = {
-        "benchmark": "hn_sequential",
-        "phase": 1,
+        "benchmark": f"hn_{args.mode}",
+        "phase": PHASE,
         "started_at": started_at.isoformat(),
         **meta,
         "params": params,
@@ -214,7 +274,8 @@ def main() -> None:
     }
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     stamp = started_at.strftime("%Y-%m-%dT%H-%M-%SZ")
-    path = RESULTS_DIR / f"{stamp}_hn_sequential_{args.target}.json"
+    label = "sequential" if args.mode == "sequential" else f"concurrent_c{params['concurrency']}"
+    path = RESULTS_DIR / f"{stamp}_hn_{label}_{args.target}.json"
     path.write_text(json.dumps(result, indent=2) + "\n")
     print(json.dumps(result["summary"], indent=2))
     print(f"wrote {path}")
