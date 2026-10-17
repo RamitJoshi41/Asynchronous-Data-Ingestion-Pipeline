@@ -81,7 +81,12 @@ def machine_info() -> dict[str, object]:
 
 def git_commit() -> dict[str, object]:
     head = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True, check=True)
-    status = subprocess.run(["git", "status", "--porcelain"], capture_output=True, text=True)
+    # Earlier result files in RESULTS_DIR don't change the measured code, so they don't count.
+    status = subprocess.run(
+        ["git", "status", "--porcelain", "--", ".", ":(exclude)docs/benchmarks/results"],
+        capture_output=True,
+        text=True,
+    )
     return {"commit": head.stdout.strip(), "dirty": bool(status.stdout.strip())}
 
 

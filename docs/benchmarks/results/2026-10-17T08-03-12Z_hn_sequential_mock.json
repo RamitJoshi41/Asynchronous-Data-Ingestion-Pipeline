@@ -1,0 +1,56 @@
+{
+  "benchmark": "hn_sequential",
+  "phase": 1,
+  "started_at": "2026-10-17T08:03:12.380045+00:00",
+  "machine": {
+    "platform": "Linux-6.8.0-138-generic-x86_64-with-glibc2.35",
+    "python": "3.12.13",
+    "cpu": "11th Gen Intel(R) Core(TM) i5-11400H @ 2.70GHz",
+    "cpu_count": 12
+  },
+  "commit": "ef7bab997bf2810e99d0f82e7f23c9aa5d015e0c",
+  "dirty": false,
+  "params": {
+    "target": "mock",
+    "items": 100,
+    "repeats": 3,
+    "latency_ms": 50.0
+  },
+  "repeats": [
+    {
+      "duration_s": 5.454014600999926,
+      "items_requested": 100,
+      "ingested": 100,
+      "invalid": 0,
+      "missing": 0,
+      "failed": false,
+      "error": null,
+      "items_per_s": 18.335117764750066
+    },
+    {
+      "duration_s": 5.440993175999893,
+      "items_requested": 100,
+      "ingested": 100,
+      "invalid": 0,
+      "missing": 0,
+      "failed": false,
+      "error": null,
+      "items_per_s": 18.378997503819324
+    },
+    {
+      "duration_s": 5.457189973999903,
+      "items_requested": 100,
+      "ingested": 100,
+      "invalid": 0,
+      "missing": 0,
+      "failed": false,
+      "error": null,
+      "items_per_s": 18.32444911693334
+    }
+  ],
+  "summary": {
+    "median_duration_s": 5.454014600999926,
+    "median_items_per_s": 18.335117764750066,
+    "error_rate": 0.0
+  }
+}

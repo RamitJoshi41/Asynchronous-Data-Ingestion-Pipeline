@@ -1,0 +1,35 @@
+{
+  "benchmark": "hn_sequential",
+  "phase": 1,
+  "started_at": "2026-10-17T08:03:35.891266+00:00",
+  "machine": {
+    "platform": "Linux-6.8.0-138-generic-x86_64-with-glibc2.35",
+    "python": "3.12.13",
+    "cpu": "11th Gen Intel(R) Core(TM) i5-11400H @ 2.70GHz",
+    "cpu_count": 12
+  },
+  "commit": "ef7bab997bf2810e99d0f82e7f23c9aa5d015e0c",
+  "dirty": true,
+  "params": {
+    "target": "real",
+    "items": 30,
+    "repeats": 1
+  },
+  "repeats": [
+    {
+      "duration_s": 12.7618101999999,
+      "items_requested": 30,
+      "ingested": 30,
+      "invalid": 0,
+      "missing": 0,
+      "failed": false,
+      "error": null,
+      "items_per_s": 2.3507636871139357
+    }
+  ],
+  "summary": {
+    "median_duration_s": 12.7618101999999,
+    "median_items_per_s": 2.3507636871139357,
+    "error_rate": 0.0
+  }
+}
