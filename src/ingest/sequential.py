@@ -9,10 +9,10 @@ from dataclasses import dataclass
 
 import httpx
 import structlog
-from pydantic import ValidationError
 from structlog.typing import FilteringBoundLogger
 
-from ingest.models.hn import SOURCE, parse_hn_item
+from ingest.models.hn import SOURCE
+from ingest.records import classify_hn_body
 from ingest.sources.hn import fetch_item, fetch_top_ids
 from ingest.storage import RunCounts, RunStatus, Store
 
@@ -76,22 +76,7 @@ async def _ingest_one(
 ) -> None:
     body = await fetch_item(client, base_url, item_id)
     counts.fetched += 1
-    try:
-        item = parse_hn_item(body)
-    except ValidationError as exc:
-        counts.invalid += 1
-        # Field locations and error types only: never the raw payload at INFO/WARNING.
-        problems = [f"{'.'.join(map(str, e['loc']))}:{e['type']}" for e in exc.errors()]
-        run_log.warning("item_invalid", item_id=item_id, problems=problems)
-        return
-    if item is None:
-        counts.missing += 1
-        run_log.info("item_missing", item_id=item_id)
-        return
-    if item.id != item_id:
-        # A body for a different record than requested is not trustworthy data for this key.
-        counts.invalid += 1
-        run_log.warning("item_id_mismatch", item_id=item_id, body_id=item.id)
-        return
-    outcome = await store.upsert_item(run_id, SOURCE, str(item.id), item.model_dump_json())
-    counts.record(outcome)
+    item = classify_hn_body(body, item_id, counts, run_log)
+    if item is not None:
+        outcome = await store.upsert_item(run_id, SOURCE, str(item.id), item.model_dump_json())
+        counts.record(outcome)
