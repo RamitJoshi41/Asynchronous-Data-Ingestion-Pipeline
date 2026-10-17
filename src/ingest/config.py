@@ -48,6 +48,13 @@ class Settings(BaseSettings):
     id_queue_maxsize: int = Field(default=100, ge=1)  # 0 would mean unbounded in asyncio
     raw_queue_maxsize: int = Field(default=100, ge=1)
 
+    # --- Reliability (Phase 3; ADR-0021..0026) -----------------------------------------------
+    retry_max_attempts: int = Field(default=4, ge=1, le=10)  # total tries, including the first
+    retry_base_delay_s: float = Field(default=0.5, gt=0)
+    retry_max_delay_s: float = Field(default=10.0, gt=0)
+    retry_after_max_s: float = Field(default=60.0, gt=0)  # longer Retry-After => give up
+    shutdown_grace_s: float = Field(default=10.0, gt=0)  # drain deadline after SIGINT/SIGTERM
+
     # --- Hacker News -----------------------------------------------------------------------
     hn_base_url: str = Field(default="https://hacker-news.firebaseio.com/v0")
     # /topstories returns up to 500 ids (HN API README), so larger limits are meaningless.
@@ -67,6 +74,8 @@ class Settings(BaseSettings):
                 f"db_pool_max_size ({self.db_pool_max_size}) must be >= pipeline_workers + 1 "
                 f"({self.pipeline_workers + 1}): one connection per flushing worker + bookkeeping"
             )
+        if self.retry_base_delay_s > self.retry_max_delay_s:
+            raise ValueError("retry_base_delay_s must be <= retry_max_delay_s")
         return self
 
 

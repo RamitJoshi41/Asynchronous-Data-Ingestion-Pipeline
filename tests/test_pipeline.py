@@ -11,12 +11,16 @@ from ingest.config import Settings
 from ingest.db import DbPool, create_pool
 from ingest.httpclient import build_http_client
 from ingest.pipeline import PipelineConfig, run_hn_concurrent
+from ingest.retry import RetryPolicy
 from ingest.sequential import run_hn_sequential
-from ingest.storage import RunStatus, Store, UpsertOutcome
+from ingest.shutdown import StopSignal
+from ingest.storage import DeadLetter, FlushResult, RunStatus, Store
 
 BASE = "https://hn.test/v0"
 ITEM_URL = r"https://hn\.test/v0/item/(?P<item_id>\d+)\.json"
 TIMEOUT_S = 5.0
+# Millisecond backoff: retry behaviour is exercised without slowing the suite down.
+FAST = RetryPolicy(max_attempts=3, base_delay_s=0.001, max_delay_s=0.005, max_retry_after_s=5)
 
 
 def story(item_id: int) -> dict[str, object]:
@@ -120,15 +124,18 @@ async def test_slow_flushes_fill_raw_queue_and_block_fetchers(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     MockHN(respx_mock, {i: story(i) for i in range(1, 21)})
-    real_upsert = store.upsert_items
+    real_flush = store.flush
 
-    async def slow_upsert(
-        run_id: int, source: str, records: Sequence[tuple[str, str]]
-    ) -> dict[str, UpsertOutcome]:
+    async def slow_flush(
+        run_id: int,
+        source: str,
+        records: Sequence[tuple[str, str]],
+        dead_letters: Sequence[DeadLetter],
+    ) -> FlushResult:
         await asyncio.sleep(0.03)  # a slow database
-        return await real_upsert(run_id, source, records)
+        return await real_flush(run_id, source, records, dead_letters)
 
-    monkeypatch.setattr(store, "upsert_items", slow_upsert)
+    monkeypatch.setattr(store, "flush", slow_flush)
     with capture_logs() as logs:
         async with asyncio.timeout(TIMEOUT_S):
             result = await run_hn_concurrent(
@@ -178,28 +185,32 @@ async def test_partial_batch_flushes_on_interval(
     assert reasons == ["interval", "interval", "final"]
 
 
-async def test_http_error_aborts_run_marks_failed_and_leaks_no_tasks(
+async def test_persistent_500_aborts_after_retries_with_exact_counts(
     store: Store, client: httpx.AsyncClient, respx_mock: respx.MockRouter, migrated_pool: DbPool
 ) -> None:
     bodies: dict[int, object] = {i: story(i) for i in range(1, 21)}
-    bodies[13] = 500
+    bodies[13] = 500  # every attempt fails: retries exhausted -> the run fails
     MockHN(respx_mock, bodies, latency=0.01)
     with pytest.RaisesGroup(httpx.HTTPStatusError, flatten_subgroups=True):
         async with asyncio.timeout(TIMEOUT_S):
             await run_hn_concurrent(
-                store, client, base_url=BASE, limit=20, cfg=cfg(workers=2, batch_size=1)
+                store,
+                client,
+                base_url=BASE,
+                limit=20,
+                cfg=cfg(workers=2, batch_size=1),
+                policy=FAST,
             )
     assert other_tasks() == set()
     row = await migrated_pool.fetchrow("SELECT * FROM ingestion_runs ORDER BY id DESC LIMIT 1")
     assert row is not None
     assert row["status"] == "failed" and "500" in row["error"]
-    # Flushes that completed before the abort are committed AND counted. A flush that was
-    # mid-statement when the TaskGroup cancelled its worker may have committed on the server
-    # without being counted, so counts are a lower bound, off by at most workers x batch_size
-    # (ADR-0020). Phase 3's graceful shutdown tightens this.
+    assert row["retries"] >= FAST.max_attempts - 1  # item 13 was retried before giving up
+    # Cancellation-safe flushes (ADR-0027): a flush that was mid-write when the TaskGroup
+    # cancelled its worker still completes AND is counted before the run is recorded. Phase 2 could
+    # only promise counted <= stored <= counted + W x B (ADR-0020); now it's exact.
     stored = await migrated_pool.fetchval("SELECT count(*) FROM items")
-    workers, batch_size = 2, 1
-    assert row["items_inserted"] <= stored <= row["items_inserted"] + workers * batch_size
+    assert stored == row["items_inserted"]
 
 
 async def test_unexpected_worker_error_aborts_instead_of_hanging(
@@ -210,10 +221,10 @@ async def test_unexpected_worker_error_aborts_instead_of_hanging(
 ) -> None:
     MockHN(respx_mock, {i: story(i) for i in range(1, 31)})
 
-    async def broken_upsert(*args: object) -> dict[str, UpsertOutcome]:
+    async def broken_flush(*args: object) -> FlushResult:
         raise RuntimeError("bug in flush")
 
-    monkeypatch.setattr(store, "upsert_items", broken_upsert)
+    monkeypatch.setattr(store, "flush", broken_flush)
     # Tiny raw queue: fetchers are blocked on put() when the workers die.
     with pytest.RaisesGroup(RuntimeError, flatten_subgroups=True):
         async with asyncio.timeout(TIMEOUT_S):
@@ -277,3 +288,187 @@ def test_config_from_settings_and_overrides() -> None:
 def test_config_rejects_non_positive_values(bad: dict[str, int | float]) -> None:
     with pytest.raises(ValueError):
         cfg(**bad)
+
+
+# --- Phase 3: reliability -------------------------------------------------------------------
+
+
+async def test_transient_failures_are_retried_and_counted(
+    store: Store, client: httpx.AsyncClient, respx_mock: respx.MockRouter, migrated_pool: DbPool
+) -> None:
+    respx_mock.get(f"{BASE}/topstories.json").mock(
+        side_effect=[httpx.ConnectError("drop"), httpx.Response(200, json=[1, 2])]
+    )
+    respx_mock.get(f"{BASE}/item/1.json").mock(
+        side_effect=[
+            httpx.ReadTimeout("slow"),
+            httpx.Response(503),
+            httpx.Response(200, json=story(1)),
+        ]
+    )
+    respx_mock.get(f"{BASE}/item/2.json").respond(json=story(2))
+    async with asyncio.timeout(TIMEOUT_S):
+        result = await run_hn_concurrent(
+            store, client, base_url=BASE, limit=2, cfg=cfg(), policy=FAST
+        )
+    assert result.status is RunStatus.SUCCEEDED
+    assert (result.counts.inserted, result.counts.retries) == (2, 3)  # 1 for ids + 2 for item 1
+    row = await migrated_pool.fetchrow(
+        "SELECT retries FROM ingestion_runs WHERE id = $1", result.run_id
+    )
+    assert row is not None and row["retries"] == 3
+
+
+async def test_schema_change_lands_in_dead_letter_and_run_continues(
+    store: Store, client: httpx.AsyncClient, respx_mock: respx.MockRouter, migrated_pool: DbPool
+) -> None:
+    changed = {**story(2), "score": "12"}  # upstream started sending score as a string
+    MockHN(respx_mock, {1: story(1), 2: changed, 3: story(3), 4: 404})
+    async with asyncio.timeout(TIMEOUT_S):
+        result = await run_hn_concurrent(
+            store, client, base_url=BASE, limit=4, cfg=cfg(), policy=FAST
+        )
+    assert result.status is RunStatus.SUCCEEDED
+    assert (result.counts.inserted, result.counts.invalid) == (2, 2)
+    rows = await migrated_pool.fetch(
+        "SELECT source_id, run_id, reason, errors, raw_body, attempts FROM dead_letter ORDER BY 1"
+    )
+    assert [(r["source_id"], r["reason"]) for r in rows] == [("2", "invalid"), ("4", "http_404")]
+    invalid = rows[0]
+    assert json.loads(invalid["errors"]) == ["score:int_type"]
+    assert json.loads(bytes(invalid["raw_body"])) == changed  # the exact rejected body, for replay
+    assert invalid["run_id"] == result.run_id and invalid["attempts"] == 1
+
+
+async def test_repeat_failure_updates_the_open_dead_letter(
+    store: Store, client: httpx.AsyncClient, respx_mock: respx.MockRouter, migrated_pool: DbPool
+) -> None:
+    MockHN(respx_mock, {1: {**story(1), "score": "x"}})
+    await run_hn_concurrent(store, client, base_url=BASE, limit=1, cfg=cfg(), policy=FAST)
+    second = await run_hn_concurrent(store, client, base_url=BASE, limit=1, cfg=cfg(), policy=FAST)
+    rows = await migrated_pool.fetch("SELECT run_id, attempts FROM dead_letter")
+    assert [(r["run_id"], r["attempts"]) for r in rows] == [(second.run_id, 2)]  # one open row
+
+
+async def test_successful_ingest_resolves_an_open_dead_letter(
+    store: Store, client: httpx.AsyncClient, respx_mock: respx.MockRouter, migrated_pool: DbPool
+) -> None:
+    bodies: dict[int, object] = {1: {**story(1), "score": "x"}}
+    MockHN(respx_mock, bodies)
+    await run_hn_concurrent(store, client, base_url=BASE, limit=1, cfg=cfg(), policy=FAST)
+    bodies[1] = story(1)  # upstream fixed the record
+    fixed = await run_hn_concurrent(store, client, base_url=BASE, limit=1, cfg=cfg(), policy=FAST)
+    row = await migrated_pool.fetchrow("SELECT resolved_at, resolved_run_id FROM dead_letter")
+    assert row is not None and row["resolved_at"] is not None
+    assert row["resolved_run_id"] == fixed.run_id
+
+
+async def test_429_retry_after_pauses_all_fetchers(
+    store: Store, client: httpx.AsyncClient, respx_mock: respx.MockRouter
+) -> None:
+    calls: list[tuple[int, float]] = []
+    loop = asyncio.get_running_loop()
+    first_429_sent = False
+
+    async def item(request: httpx.Request, item_id: str) -> httpx.Response:
+        nonlocal first_429_sent
+        calls.append((int(item_id), loop.time()))
+        if item_id == "1" and not first_429_sent:
+            first_429_sent = True
+            return httpx.Response(429, headers={"Retry-After": "1"})
+        await asyncio.sleep(0.05)
+        return httpx.Response(200, json=story(int(item_id)))
+
+    respx_mock.get(f"{BASE}/topstories.json").respond(json=list(range(1, 11)))
+    respx_mock.get(url__regex=ITEM_URL).mock(side_effect=item)
+    async with asyncio.timeout(TIMEOUT_S):
+        result = await run_hn_concurrent(
+            store, client, base_url=BASE, limit=10, cfg=cfg(concurrency=2), policy=FAST
+        )
+    assert result.counts.inserted == 10
+    started = calls[0][1]
+    # Item 1 got 429 + Retry-After: 1 at t0. Fetcher 2 had one request in flight already; every
+    # request STARTED after that must wait for the shared gate, i.e. begin >= ~1 s after t0.
+    later = [t - started for _, t in calls[2:]]
+    assert all(dt >= 0.95 for dt in later), later
+
+
+async def test_stop_drains_in_flight_work_and_marks_cancelled(
+    store: Store, client: httpx.AsyncClient, respx_mock: respx.MockRouter, migrated_pool: DbPool
+) -> None:
+    MockHN(respx_mock, {i: story(i) for i in range(1, 201)}, latency=0.02)
+    stop = StopSignal()
+    asyncio.get_running_loop().call_later(0.1, stop.request, "test")
+    async with asyncio.timeout(TIMEOUT_S):
+        result = await run_hn_concurrent(
+            store, client, base_url=BASE, limit=200, cfg=cfg(batch_size=50), stop=stop
+        )
+    assert result.status is RunStatus.CANCELLED
+    assert result.stats.skipped_on_stop > 0 and result.counts.fetched < 200
+    # Everything that was fetched was flushed (no record left in a buffer) and counts are exact.
+    stored = await migrated_pool.fetchval("SELECT count(*) FROM items")
+    row = await migrated_pool.fetchrow(
+        "SELECT status, items_fetched, items_inserted, finished_at FROM ingestion_runs"
+    )
+    assert row is not None and row["status"] == "cancelled" and row["finished_at"] is not None
+    assert stored == row["items_inserted"] == row["items_fetched"] == result.counts.fetched
+    assert other_tasks() == set()
+
+
+async def test_drain_past_deadline_is_cut_short_but_still_recorded(
+    store: Store, client: httpx.AsyncClient, respx_mock: respx.MockRouter, migrated_pool: DbPool
+) -> None:
+    MockHN(respx_mock, {i: story(i) for i in range(1, 11)}, latency=5.0)  # requests that hang
+    stop = StopSignal()
+    asyncio.get_running_loop().call_later(0.1, stop.request, "test")
+    loop = asyncio.get_running_loop()
+    t0 = loop.time()
+    async with asyncio.timeout(TIMEOUT_S):
+        result = await run_hn_concurrent(
+            store, client, base_url=BASE, limit=10, cfg=cfg(), stop=stop, drain_timeout_s=0.3
+        )
+    assert loop.time() - t0 < 1.5  # did not wait out the 5 s requests
+    assert result.status is RunStatus.CANCELLED
+    row = await migrated_pool.fetchrow("SELECT status, error FROM ingestion_runs")
+    assert row is not None and row["status"] == "cancelled" and "drain exceeded" in row["error"]
+    assert other_tasks() == set()
+
+
+async def test_forced_cancellation_lets_the_in_progress_batch_land(
+    store: Store,
+    client: httpx.AsyncClient,
+    respx_mock: respx.MockRouter,
+    migrated_pool: DbPool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    MockHN(respx_mock, {i: story(i) for i in range(1, 101)}, latency=0.01)
+    real_flush = store.flush
+    write_started = asyncio.Event()
+
+    async def slow_flush(
+        run_id: int,
+        source: str,
+        records: Sequence[tuple[str, str]],
+        dead_letters: Sequence[DeadLetter],
+    ) -> FlushResult:
+        write_started.set()
+        await asyncio.sleep(0.1)  # a slow write that is IN PROGRESS when cancellation arrives
+        return await real_flush(run_id, source, records, dead_letters)
+
+    monkeypatch.setattr(store, "flush", slow_flush)
+    task = asyncio.create_task(
+        run_hn_concurrent(store, client, base_url=BASE, limit=100, cfg=cfg(workers=1, batch_size=5))
+    )
+    await write_started.wait()
+    task.cancel()  # what a second Ctrl-C does, exactly while the first batch is being written
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    stored = await migrated_pool.fetchval("SELECT count(*) FROM items")
+    row = await migrated_pool.fetchrow("SELECT status, items_inserted, error FROM ingestion_runs")
+    assert (
+        row is not None and row["status"] == "cancelled" and row["error"] == "forced cancellation"
+    )
+    # The shielded write finished instead of being cancelled and rolled back, and was counted
+    # before the run was recorded (ADR-0027). Without the shield this batch would be lost: 0 rows.
+    assert stored == row["items_inserted"] == 5
+    assert other_tasks() == set()

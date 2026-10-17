@@ -4,6 +4,8 @@
     uv run python -m benchmarks.run --target mock --items 200 --latency-ms 50 --mode concurrent \
         --concurrency 20
     uv run python -m benchmarks.run --target real --items 30 --mode concurrent --concurrency 5
+    uv run python -m benchmarks.run --target mock --items 200 --mode concurrent --concurrency 20 \
+        --fail-rate 0.1 --rate-limit-rate 0.01 [--max-attempts 1]     # Phase 3 failure injection
 
 Each repeat ingests into a FRESH throwaway schema in the dev database (so every repeat measures
 the same cold-insert path and mock data never mixes with real data), then drops it. Results are
@@ -35,10 +37,11 @@ from ingest.config import Settings, get_settings
 from ingest.db import create_pool
 from ingest.httpclient import build_http_client
 from ingest.pipeline import ConcurrentRunSummary, PipelineConfig, run_hn_concurrent, settings_for
+from ingest.retry import RetryPolicy
 from ingest.sequential import RunSummary, run_hn_sequential
 from ingest.storage import Store
 
-PHASE = 2  # the phase that produced new result files
+PHASE = 3  # the phase that produced new result files
 REAL_MAX_ITEMS, REAL_MAX_CONCURRENCY = 30, 10  # politeness caps for the real API
 RESULTS_DIR = Path(__file__).resolve().parent.parent / "docs" / "benchmarks" / "results"
 
@@ -57,6 +60,7 @@ class RepeatResult:
     peak_in_flight: int = 0
     blocked_puts: int = 0
     flushes: int = 0
+    retries: int = 0
 
     @property
     def items_per_s(self) -> float:
@@ -98,7 +102,14 @@ def git_commit() -> dict[str, object]:
         capture_output=True,
         text=True,
     )
-    return {"commit": head.stdout.strip(), "dirty": bool(status.stdout.strip())}
+    # Content hashes of what was measured. Git objects are content-addressed, so these stay valid
+    # even if the commit is later amended or rebased (e.g. to add these results to it): verify
+    # with `git rev-parse <commit>:src` etc. (ADR-0012 update, Phase 3).
+    trees = {}
+    for path in ("src", "benchmarks", "pyproject.toml", "uv.lock"):
+        rev = subprocess.run(["git", "rev-parse", f"HEAD:{path}"], capture_output=True, text=True)
+        trees[path] = rev.stdout.strip() or None
+    return {"commit": head.stdout.strip(), "dirty": bool(status.stdout.strip()), "trees": trees}
 
 
 def free_port() -> int:
@@ -108,7 +119,15 @@ def free_port() -> int:
         return port
 
 
-async def start_mock(port: int, items: int, latency_ms: float) -> asyncio.subprocess.Process:
+async def start_mock(
+    port: int,
+    items: int,
+    latency_ms: float,
+    *,
+    fail_rate: float = 0.0,
+    rate_limit_rate: float = 0.0,
+    seed: int = 0,
+) -> asyncio.subprocess.Process:
     # A separate PROCESS: the server must not share (and distort) the measured event loop.
     proc = await asyncio.create_subprocess_exec(
         sys.executable,
@@ -120,6 +139,12 @@ async def start_mock(port: int, items: int, latency_ms: float) -> asyncio.subpro
         str(items),
         "--latency-ms",
         str(latency_ms),
+        "--fail-rate",
+        str(fail_rate),
+        "--rate-limit-rate",
+        str(rate_limit_rate),
+        "--seed",
+        str(seed),
     )
     async with httpx.AsyncClient(timeout=1.0) as probe:
         for _ in range(100):  # up to ~10 s for the server to come up
@@ -161,14 +186,17 @@ async def one_repeat(
         try:
             async with build_http_client(scoped) as client:
                 store = Store(pool, acquire_timeout=scoped.db_acquire_timeout_s)
+                policy = RetryPolicy.from_settings(scoped)
                 cpu_before = time.process_time()
                 try:
                     s: RunSummary
                     if cfg is None:
-                        s = await run_hn_sequential(store, client, base_url=base_url, limit=items)
+                        s = await run_hn_sequential(
+                            store, client, base_url=base_url, limit=items, policy=policy
+                        )
                     else:
                         s = await run_hn_concurrent(
-                            store, client, base_url=base_url, limit=items, cfg=cfg
+                            store, client, base_url=base_url, limit=items, cfg=cfg, policy=policy
                         )
                 except Exception as exc:  # a failed run is a data point, not a crash
                     return RepeatResult(0.0, items, 0, 0, 0, True, repr(exc)[:300])
@@ -189,6 +217,7 @@ async def one_repeat(
             peak_in_flight=stats.peak_in_flight if stats else 1,
             blocked_puts=stats.blocked_puts if stats else 0,
             flushes=stats.flushes if stats else c.inserted + c.updated + c.unchanged,
+            retries=c.retries,
         )
     finally:
         await admin.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
@@ -204,7 +233,14 @@ async def run_benchmark(args: argparse.Namespace, settings: Settings) -> list[Re
     proc = None
     if args.target == "mock":
         port = free_port()
-        proc = await start_mock(port, args.items, args.latency_ms)
+        proc = await start_mock(
+            port,
+            args.items,
+            args.latency_ms,
+            fail_rate=args.fail_rate,
+            rate_limit_rate=args.rate_limit_rate,
+            seed=args.seed,
+        )
         base_url = f"http://127.0.0.1:{port}/v0"
     else:
         base_url = settings.hn_base_url
@@ -227,6 +263,10 @@ def main() -> None:
     parser.add_argument("--concurrency", type=int, help="concurrent mode (FETCH_CONCURRENCY)")
     parser.add_argument("--workers", type=int, help="concurrent mode (PIPELINE_WORKERS)")
     parser.add_argument("--batch-size", type=int, help="concurrent mode (BATCH_SIZE)")
+    parser.add_argument("--fail-rate", type=float, default=0.0, help="mock: fraction of 500s")
+    parser.add_argument("--rate-limit-rate", type=float, default=0.0, help="mock: fraction of 429s")
+    parser.add_argument("--seed", type=int, default=0, help="mock: fault pattern seed")
+    parser.add_argument("--max-attempts", type=int, help="RETRY_MAX_ATTEMPTS (1 = no retries)")
     parser.add_argument("--items", type=int, default=100)
     parser.add_argument("--latency-ms", type=float, default=50.0, help="mock only")
     parser.add_argument("--repeats", type=int, default=None, help="default: 3 mock, 1 real")
@@ -239,23 +279,30 @@ def main() -> None:
         )
     if args.target == "real" and (args.concurrency or 0) > REAL_MAX_CONCURRENCY:
         parser.error(f"real-API runs are capped at --concurrency {REAL_MAX_CONCURRENCY}")
+    if args.target == "real" and (args.fail_rate or args.rate_limit_rate):
+        parser.error("--fail-rate/--rate-limit-rate inject faults into the MOCK only")
     if args.mode == "sequential" and (args.concurrency or args.workers or args.batch_size):
         parser.error("--concurrency/--workers/--batch-size only apply to --mode concurrent")
 
     # Sync work (git, /proc reads) happens before the event loop starts.
     started_at = datetime.now(UTC)
     meta = {"machine": machine_info(), **git_commit()}
-    repeats = asyncio.run(run_benchmark(args, get_settings()))
-
     settings = get_settings()
+    if args.max_attempts is not None:
+        settings = settings.model_copy(update={"retry_max_attempts": args.max_attempts})
+    repeats = asyncio.run(run_benchmark(args, settings))
+
     params: dict[str, object] = {
         "target": args.target,
         "mode": args.mode,
         "items": args.items,
         "repeats": args.repeats,
     }
+    params["retry_max_attempts"] = settings.retry_max_attempts
     if args.target == "mock":
         params["latency_ms"] = args.latency_ms
+        params |= {"fail_rate": args.fail_rate, "rate_limit_rate": args.rate_limit_rate}
+        params["seed"] = args.seed
     if args.mode == "concurrent":
         cfg = PipelineConfig.from_settings(
             settings, concurrency=args.concurrency, workers=args.workers, batch_size=args.batch_size
@@ -275,6 +322,8 @@ def main() -> None:
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     stamp = started_at.strftime("%Y-%m-%dT%H-%M-%SZ")
     label = "sequential" if args.mode == "sequential" else f"concurrent_c{params['concurrency']}"
+    if args.fail_rate or args.rate_limit_rate:
+        label += f"_faults_a{settings.retry_max_attempts}"
     path = RESULTS_DIR / f"{stamp}_hn_{label}_{args.target}.json"
     path.write_text(json.dumps(result, indent=2) + "\n")
     print(json.dumps(result["summary"], indent=2))

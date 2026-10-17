@@ -5,7 +5,7 @@ import httpx
 import pytest
 import respx
 
-from ingest.__main__ import main, migrate_command, run_hn_command
+from ingest.__main__ import main, migrate_command, replay_command, run_hn_command
 from ingest.config import Settings, get_settings
 from ingest.db import DbPool, create_pool
 from ingest.httpclient import build_http_client, http_limits
@@ -22,7 +22,7 @@ def fresh_settings_cache() -> Iterator[None]:
 
 
 async def test_migrate_command_is_idempotent(schema_settings: Settings) -> None:
-    assert await migrate_command(schema_settings) == [1, 2]
+    assert await migrate_command(schema_settings) == [1, 2, 3, 4]
     assert await migrate_command(schema_settings) == []
 
 
@@ -52,7 +52,7 @@ def test_main_migrate_reads_db_dsn_from_env(
     assert main(["migrate"]) == 0
     assert main(["migrate"]) == 0
     out = capsys.readouterr().out
-    assert "applied migrations: [1, 2]" in out and "schema up to date" in out
+    assert "applied migrations: [1, 2, 3, 4]" in out and "schema up to date" in out
 
 
 @pytest.mark.parametrize("argv", [["run", "hn", "--limit", "0"], ["run", "hn", "--limit", "501"]])
@@ -116,3 +116,18 @@ def test_main_rejects_invalid_pipeline_override() -> None:
     with pytest.raises(SystemExit) as exc_info:
         main(["run", "hn", "--concurrency", "0"])
     assert exc_info.value.code == 2
+
+
+async def test_replay_command_runs_a_replay(schema_settings: Settings) -> None:
+    await migrate_command(schema_settings)
+    summary = await replay_command(schema_settings)
+    assert summary.counts.fetched == 0  # nothing dead-lettered yet: a clean no-op run
+
+
+def test_main_replay(
+    schema_settings: Settings, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setenv("DB_DSN", schema_settings.db_dsn.get_secret_value())
+    assert main(["migrate"]) == 0
+    assert main(["replay", "--batch-size", "10"]) == 0
+    assert "status=<RunStatus.SUCCEEDED" in capsys.readouterr().out

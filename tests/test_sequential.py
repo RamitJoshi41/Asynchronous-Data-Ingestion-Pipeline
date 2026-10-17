@@ -9,8 +9,12 @@ from structlog.testing import capture_logs
 from ingest.config import Settings
 from ingest.db import DbPool
 from ingest.httpclient import build_http_client
+from ingest.retry import RetryPolicy
 from ingest.sequential import run_hn_sequential
+from ingest.shutdown import StopSignal
 from ingest.storage import RunStatus, Store
+
+FAST = RetryPolicy(max_attempts=3, base_delay_s=0.001, max_delay_s=0.005, max_retry_after_s=5)
 
 BASE = "https://hn.test/v0"
 STORY = {"id": 1, "type": "story", "by": "a", "time": 1175714200, "title": "t", "score": 5}
@@ -107,7 +111,7 @@ async def test_http_error_mid_run_marks_run_failed_and_reraises(
     respx_mock.get(f"{BASE}/item/8.json").respond(status_code=500)
 
     with pytest.raises(httpx.HTTPStatusError):
-        await run_hn_sequential(store, client, base_url=BASE, limit=3)
+        await run_hn_sequential(store, client, base_url=BASE, limit=3, policy=FAST)
 
     row = await migrated_pool.fetchrow("SELECT * FROM ingestion_runs ORDER BY id DESC LIMIT 1")
     assert row is not None
@@ -126,7 +130,7 @@ async def test_network_failure_on_top_ids_marks_run_failed(
 ) -> None:
     respx_mock.get(f"{BASE}/topstories.json").mock(side_effect=httpx.ConnectError("down"))
     with pytest.raises(httpx.ConnectError):
-        await run_hn_sequential(store, client, base_url=BASE, limit=3)
+        await run_hn_sequential(store, client, base_url=BASE, limit=3, policy=FAST)
     row = await migrated_pool.fetchrow(
         "SELECT status, items_fetched FROM ingestion_runs ORDER BY id DESC LIMIT 1"
     )
@@ -150,3 +154,44 @@ async def test_logs_carry_run_context_but_never_payloads(
         "run_started",
         "run_finished",
     ]
+
+
+# --- Phase 3: reliability (same shared helpers as the concurrent pipeline) ------------------
+
+
+async def test_rejects_are_dead_lettered(
+    store: Store, client: httpx.AsyncClient, respx_mock: respx.MockRouter, migrated_pool: DbPool
+) -> None:
+    mock_items(respx_mock, MIXED)
+    await run_hn_sequential(store, client, base_url=BASE, limit=5, policy=FAST)
+    rows = await migrated_pool.fetch("SELECT source_id, reason FROM dead_letter ORDER BY 1")
+    assert [(r["source_id"], r["reason"]) for r in rows] == [("2", "invalid"), ("5", "id_mismatch")]
+
+
+async def test_transient_error_is_retried(
+    store: Store, client: httpx.AsyncClient, respx_mock: respx.MockRouter
+) -> None:
+    respx_mock.get(f"{BASE}/topstories.json").respond(json=[1])
+    respx_mock.get(f"{BASE}/item/1.json").mock(
+        side_effect=[httpx.ConnectError("drop"), httpx.Response(200, json=STORY)]
+    )
+    summary = await run_hn_sequential(store, client, base_url=BASE, limit=1, policy=FAST)
+    assert (summary.counts.inserted, summary.counts.retries) == (1, 1)
+
+
+async def test_stop_ends_run_after_current_item_as_cancelled(
+    store: Store, client: httpx.AsyncClient, respx_mock: respx.MockRouter, migrated_pool: DbPool
+) -> None:
+    stop = StopSignal()
+    respx_mock.get(f"{BASE}/topstories.json").respond(json=[1, 4, 7])
+
+    def first_then_stop(request: httpx.Request) -> httpx.Response:
+        stop.request("test")  # a signal arrives while item 1 is being fetched
+        return httpx.Response(200, json=STORY)
+
+    respx_mock.get(f"{BASE}/item/1.json").mock(side_effect=first_then_stop)
+    summary = await run_hn_sequential(store, client, base_url=BASE, limit=3, stop=stop)
+    assert summary.status is RunStatus.CANCELLED
+    assert summary.counts.fetched == 1  # item 1 finished; 4 and 7 never requested
+    row = await migrated_pool.fetchrow("SELECT status, items_inserted FROM ingestion_runs")
+    assert row is not None and (row["status"], row["items_inserted"]) == ("cancelled", 1)

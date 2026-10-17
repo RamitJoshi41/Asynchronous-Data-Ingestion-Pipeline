@@ -6,7 +6,15 @@ import pytest
 
 from ingest.config import Settings
 from ingest.db import DbPool, create_pool
-from ingest.storage import MAX_ERROR_CHARS, RunCounts, RunStatus, Store, UpsertOutcome
+from ingest.storage import (
+    MAX_ERROR_CHARS,
+    DeadLetter,
+    RunCounts,
+    RunKind,
+    RunStatus,
+    Store,
+    UpsertOutcome,
+)
 
 T = 5.0
 
@@ -14,6 +22,12 @@ T = 5.0
 @pytest.fixture
 def store(migrated_pool: DbPool) -> Store:
     return Store(migrated_pool, acquire_timeout=T)
+
+
+async def upsert_one(
+    store: Store, run_id: int, source: str, source_id: str, payload: str
+) -> UpsertOutcome:
+    return (await store.upsert_items(run_id, source, [(source_id, payload)]))[source_id]
 
 
 async def item_row(pool: DbPool, source: str, source_id: str) -> asyncpg.Record:
@@ -76,20 +90,20 @@ async def test_upsert_insert_then_unchanged_then_update(
     run2 = await store.start_run("hacker_news")
     v1 = json.dumps({"id": 1, "score": 10})
 
-    assert await store.upsert_item(run1, "hacker_news", "1", v1) is UpsertOutcome.INSERTED
+    assert await upsert_one(store, run1, "hacker_news", "1", v1) is UpsertOutcome.INSERTED
     first = await item_row(migrated_pool, "hacker_news", "1")
     assert json.loads(first["payload"]) == {"id": 1, "score": 10}
     assert first["last_changed_run_id"] == run1
 
     # Same payload from a later run: nothing is written. Same row version (xmin), same timestamps.
-    assert await store.upsert_item(run2, "hacker_news", "1", v1) is UpsertOutcome.UNCHANGED
+    assert await upsert_one(store, run2, "hacker_news", "1", v1) is UpsertOutcome.UNCHANGED
     same = await item_row(migrated_pool, "hacker_news", "1")
     assert same["xmin"] == first["xmin"]
     assert same["updated_at"] == first["updated_at"]
     assert same["last_changed_run_id"] == run1
 
     v2 = json.dumps({"id": 1, "score": 11})
-    assert await store.upsert_item(run2, "hacker_news", "1", v2) is UpsertOutcome.UPDATED
+    assert await upsert_one(store, run2, "hacker_news", "1", v2) is UpsertOutcome.UPDATED
     changed = await item_row(migrated_pool, "hacker_news", "1")
     assert changed["xmin"] != first["xmin"]
     assert changed["updated_at"] > first["updated_at"]
@@ -98,8 +112,8 @@ async def test_upsert_insert_then_unchanged_then_update(
 
 async def test_jsonb_comparison_ignores_key_order_and_whitespace(store: Store) -> None:
     run_id = await store.start_run("hacker_news")
-    await store.upsert_item(run_id, "hacker_news", "7", '{"a": 1, "b": 2}')
-    outcome = await store.upsert_item(run_id, "hacker_news", "7", '{ "b":2,"a":1 }')
+    await upsert_one(store, run_id, "hacker_news", "7", '{"a": 1, "b": 2}')
+    outcome = await upsert_one(store, run_id, "hacker_news", "7", '{ "b":2,"a":1 }')
     assert outcome is UpsertOutcome.UNCHANGED
 
 
@@ -107,14 +121,14 @@ async def test_same_id_in_different_sources_are_separate_rows(
     store: Store, migrated_pool: DbPool
 ) -> None:
     run_id = await store.start_run("hacker_news")
-    assert await store.upsert_item(run_id, "hacker_news", "1", "{}") is UpsertOutcome.INSERTED
-    assert await store.upsert_item(run_id, "other", "1", "{}") is UpsertOutcome.INSERTED
+    assert await upsert_one(store, run_id, "hacker_news", "1", "{}") is UpsertOutcome.INSERTED
+    assert await upsert_one(store, run_id, "other", "1", "{}") is UpsertOutcome.INSERTED
     assert await migrated_pool.fetchval("SELECT count(*) FROM items") == 2
 
 
 async def test_upsert_requires_existing_run(store: Store) -> None:
     with pytest.raises(asyncpg.ForeignKeyViolationError):
-        await store.upsert_item(424242, "hacker_news", "1", "{}")
+        await upsert_one(store, 424242, "hacker_news", "1", "{}")
 
 
 def test_run_counts_record_outcomes() -> None:
@@ -184,3 +198,94 @@ async def test_undersized_pool_flush_times_out_instead_of_hanging(
 
 def test_store_reports_pool_max_size(store: Store, test_settings: Settings) -> None:
     assert store.pool_max_size == test_settings.db_pool_max_size
+
+
+# --- Phase 3: dead letters, transactional flush, run kinds --------------------------------
+
+
+async def open_dead_letters(pool: DbPool) -> list[asyncpg.Record]:
+    return await pool.fetch(
+        "SELECT source_id, reason, attempts, run_id FROM dead_letter "
+        "WHERE resolved_at IS NULL ORDER BY source_id"
+    )
+
+
+async def test_flush_writes_items_and_dead_letters_together(
+    store: Store, migrated_pool: DbPool
+) -> None:
+    run_id = await store.start_run("hacker_news")
+    reject = DeadLetter("2", "invalid", ["score:int_type"], b'{"id": 2, "score": "x"}')
+    result = await store.flush(run_id, "hacker_news", [("1", '{"id": 1}')], [reject])
+    assert result.outcomes == {"1": UpsertOutcome.INSERTED}
+    assert (result.dead_lettered, result.resolved) == (1, 0)
+    row = await migrated_pool.fetchrow("SELECT * FROM dead_letter")
+    assert row is not None
+    assert (row["source_id"], row["reason"], row["run_id"]) == ("2", "invalid", run_id)
+    assert json.loads(row["errors"]) == ["score:int_type"]
+    assert bytes(row["raw_body"]) == b'{"id": 2, "score": "x"}'
+
+
+async def test_flush_is_atomic(store: Store, migrated_pool: DbPool) -> None:
+    run_id = await store.start_run("hacker_news")
+    broken = DeadLetter("2", None)  # type: ignore[arg-type]  # violates reason NOT NULL
+    with pytest.raises(asyncpg.NotNullViolationError):
+        await store.flush(run_id, "hacker_news", [("1", '{"id": 1}')], [broken])
+    # The item upsert ran first in the same transaction and was rolled back with it.
+    assert await migrated_pool.fetchval("SELECT count(*) FROM items") == 0
+
+
+async def test_non_utf8_body_is_stored_byte_for_byte(store: Store, migrated_pool: DbPool) -> None:
+    run_id = await store.start_run("hacker_news")
+    garbage = b"\xff\xfe not utf-8 \x00"
+    await store.flush(run_id, "hacker_news", [], [DeadLetter("9", "invalid", [], garbage)])
+    stored = await migrated_pool.fetchval("SELECT raw_body FROM dead_letter")
+    assert bytes(stored) == garbage  # why the column is bytea, not text/jsonb
+
+
+async def test_repeat_failure_keeps_one_open_row(store: Store, migrated_pool: DbPool) -> None:
+    run1 = await store.start_run("hacker_news")
+    run2 = await store.start_run("hacker_news")
+    await store.flush(run1, "hacker_news", [], [DeadLetter("7", "invalid", ["a:x"], b"v1")])
+    await store.flush(run2, "hacker_news", [], [DeadLetter("7", "id_mismatch", ["id:8"], b"v2")])
+    rows = await open_dead_letters(migrated_pool)
+    assert [(r["reason"], r["attempts"], r["run_id"]) for r in rows] == [("id_mismatch", 2, run2)]
+
+
+async def test_clean_ingest_resolves_open_dead_letter_and_later_failure_opens_new_one(
+    store: Store, migrated_pool: DbPool
+) -> None:
+    run1, run2, run3 = [await store.start_run("hacker_news") for _ in range(3)]
+    await store.flush(run1, "hacker_news", [], [DeadLetter("5", "invalid", [], b"bad")])
+    fixed = await store.flush(run2, "hacker_news", [("5", '{"id": 5}')], [])
+    assert fixed.resolved == 1 and await open_dead_letters(migrated_pool) == []
+    resolved = await migrated_pool.fetchrow("SELECT resolved_run_id FROM dead_letter")
+    assert resolved is not None and resolved["resolved_run_id"] == run2
+
+    # History is kept: a new failure later opens a fresh row instead of reopening the old one.
+    await store.flush(run3, "hacker_news", [], [DeadLetter("5", "invalid", [], b"bad again")])
+    assert await migrated_pool.fetchval("SELECT count(*) FROM dead_letter") == 2
+    assert [r["attempts"] for r in await open_dead_letters(migrated_pool)] == [1]
+
+
+async def test_open_dead_letters_pages_and_skips_http_and_resolved(
+    store: Store, migrated_pool: DbPool
+) -> None:
+    run_id = await store.start_run("hacker_news")
+    rejects = [DeadLetter(str(i), "invalid", [], b"x") for i in range(1, 6)]
+    rejects.append(DeadLetter("404", "http_404", [], b"Not Found"))
+    await store.flush(run_id, "hacker_news", [("3", '{"id": 3}')], [])  # resolves nothing yet
+    await store.flush(run_id, "hacker_news", [], rejects)
+    await store.flush(run_id, "hacker_news", [("3", '{"id": 3}')], [])  # resolves "3"
+
+    first = await store.open_dead_letters("hacker_news", after_id=0, limit=2)
+    rest = await store.open_dead_letters("hacker_news", after_id=first[-1].id, limit=10)
+    assert [d.source_id for d in first + rest] == ["1", "2", "4", "5"]  # no "3", no http_404
+
+
+async def test_run_kind_retries_and_cancelled_status_are_recorded(
+    store: Store, migrated_pool: DbPool
+) -> None:
+    run_id = await store.start_run("hacker_news", RunKind.REPLAY)
+    await store.finish_run(run_id, RunStatus.CANCELLED, RunCounts(retries=4))
+    row = await migrated_pool.fetchrow("SELECT kind, status, retries FROM ingestion_runs")
+    assert row is not None and tuple(row) == ("replay", "cancelled", 4)

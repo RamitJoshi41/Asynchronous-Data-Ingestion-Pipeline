@@ -1,0 +1,87 @@
+{
+  "benchmark": "hn_concurrent",
+  "phase": 3,
+  "started_at": "2026-10-17T12:40:07.799237+00:00",
+  "machine": {
+    "platform": "Linux-6.8.0-138-generic-x86_64-with-glibc2.35",
+    "python": "3.12.13",
+    "cpu": "11th Gen Intel(R) Core(TM) i5-11400H @ 2.70GHz",
+    "cpu_count": 12
+  },
+  "commit": "30a038f1318d603569cc5985cae24512b0f15046",
+  "dirty": false,
+  "trees": {
+    "src": "935cf7b37477dc15a54620daea30682626035e2e",
+    "benchmarks": "9ff125fbc0003fcc3e8c56c6b6dd2b6ae29077f7",
+    "pyproject.toml": "1bedcdf436eadb9d419747be8835ec2ba76b916d",
+    "uv.lock": "5c72c00fe916a584a298903c21c0423f6314d69e"
+  },
+  "params": {
+    "target": "mock",
+    "mode": "concurrent",
+    "items": 200,
+    "repeats": 3,
+    "retry_max_attempts": 1,
+    "latency_ms": 50.0,
+    "fail_rate": 0.1,
+    "rate_limit_rate": 0.01,
+    "seed": 7,
+    "concurrency": 20,
+    "workers": 2,
+    "batch_size": 50,
+    "flush_interval_s": 1.0,
+    "raw_queue_maxsize": 100
+  },
+  "repeats": [
+    {
+      "duration_s": 0.0,
+      "items_requested": 200,
+      "ingested": 0,
+      "invalid": 0,
+      "missing": 0,
+      "failed": true,
+      "error": "ExceptionGroup('unhandled errors in a TaskGroup', [ExceptionGroup('unhandled errors in a TaskGroup', [HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://127.0.0.1:41755/v0/item/4.json'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")]",
+      "client_cpu_s": 0.0,
+      "peak_in_flight": 0,
+      "blocked_puts": 0,
+      "flushes": 0,
+      "retries": 0,
+      "items_per_s": 0.0
+    },
+    {
+      "duration_s": 0.0,
+      "items_requested": 200,
+      "ingested": 0,
+      "invalid": 0,
+      "missing": 0,
+      "failed": true,
+      "error": "ExceptionGroup('unhandled errors in a TaskGroup', [ExceptionGroup('unhandled errors in a TaskGroup', [HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://127.0.0.1:41755/v0/item/11.json'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")",
+      "client_cpu_s": 0.0,
+      "peak_in_flight": 0,
+      "blocked_puts": 0,
+      "flushes": 0,
+      "retries": 0,
+      "items_per_s": 0.0
+    },
+    {
+      "duration_s": 0.0,
+      "items_requested": 200,
+      "ingested": 0,
+      "invalid": 0,
+      "missing": 0,
+      "failed": true,
+      "error": "ExceptionGroup('unhandled errors in a TaskGroup', [ExceptionGroup('unhandled errors in a TaskGroup', [HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://127.0.0.1:41755/v0/item/8.json'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")]",
+      "client_cpu_s": 0.0,
+      "peak_in_flight": 0,
+      "blocked_puts": 0,
+      "flushes": 0,
+      "retries": 0,
+      "items_per_s": 0.0
+    }
+  ],
+  "summary": {
+    "median_duration_s": 0.0,
+    "median_items_per_s": 0.0,
+    "error_rate": 1.0
+  }
+}

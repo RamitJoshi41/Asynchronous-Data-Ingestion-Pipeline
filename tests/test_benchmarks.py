@@ -10,9 +10,14 @@ from ingest.config import Settings
 from ingest.models.hn import HNItem, parse_hn_item, parse_top_ids
 
 
-def asgi_client(n_items: int, latency_s: float = 0.0) -> httpx.AsyncClient:
+def asgi_client(
+    n_items: int, latency_s: float = 0.0, fail_rate: float = 0.0, rate_limit_rate: float = 0.0
+) -> httpx.AsyncClient:
     # In-process ASGI transport: exercises the real app without opening a socket.
-    transport = httpx.ASGITransport(app=create_app(n_items=n_items, latency_s=latency_s))
+    app = create_app(
+        n_items=n_items, latency_s=latency_s, fail_rate=fail_rate, rate_limit_rate=rate_limit_rate
+    )
+    transport = httpx.ASGITransport(app=app)
     return httpx.AsyncClient(transport=transport, base_url="http://mock")
 
 
@@ -74,3 +79,19 @@ async def test_pool_exhaustion_scenarios_serialise_or_time_out(test_settings: Se
         test_settings, "timeout", workers=3, pool_size=1, hold_s=0.3, acquire_timeout_s=0.1
     )
     assert starved.timeouts == 2 and len(starved.acquire_waits_s) == 1
+
+
+async def test_mock_injects_500s_and_429s_with_retry_after() -> None:
+    async with asgi_client(5, fail_rate=1.0) as client:
+        assert (await client.get("/v0/item/1.json")).status_code == 500
+    async with asgi_client(5, rate_limit_rate=1.0) as client:
+        response = await client.get("/v0/item/1.json")
+        assert response.status_code == 429 and response.headers["Retry-After"] == "1"
+    async with asgi_client(5, fail_rate=1.0) as client:  # the id list itself is never faulted
+        assert (await client.get("/v0/topstories.json")).status_code == 200
+
+
+async def test_mock_fault_rate_is_roughly_honoured() -> None:
+    async with asgi_client(5, fail_rate=0.2) as client:
+        codes = [(await client.get("/v0/item/1.json")).status_code for _ in range(500)]
+    assert 0.12 < codes.count(500) / len(codes) < 0.28

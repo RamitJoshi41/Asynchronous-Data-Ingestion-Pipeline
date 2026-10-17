@@ -69,6 +69,10 @@ def test_default_dsn_targets_compose_db_port() -> None:
         ("FLUSH_INTERVAL_S", "0"),
         ("RAW_QUEUE_MAXSIZE", "0"),  # asyncio would treat 0 as unbounded
         ("ID_QUEUE_MAXSIZE", "0"),
+        ("RETRY_MAX_ATTEMPTS", "0"),
+        ("RETRY_MAX_ATTEMPTS", "11"),
+        ("RETRY_BASE_DELAY_S", "0"),
+        ("SHUTDOWN_GRACE_S", "0"),
     ],
 )
 def test_out_of_range_values_fail_at_startup(
@@ -97,3 +101,10 @@ def test_pool_must_fit_workers_plus_bookkeeping(monkeypatch: pytest.MonkeyPatch)
 def test_pipeline_defaults_are_consistent() -> None:
     s = Settings(_env_file=None)
     assert s.db_pool_max_size >= s.pipeline_workers + 1
+
+
+def test_retry_base_delay_cannot_exceed_max(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("RETRY_BASE_DELAY_S", "20")
+    monkeypatch.setenv("RETRY_MAX_DELAY_S", "10")
+    with pytest.raises(ValidationError, match="retry_base_delay_s"):
+        Settings(_env_file=None)

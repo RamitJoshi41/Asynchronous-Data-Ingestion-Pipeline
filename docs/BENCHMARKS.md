@@ -4,7 +4,9 @@ Only numbers produced by `benchmarks/run.py` appear here. Each one links to its 
 `docs/benchmarks/results/`. Harness: `benchmarks/run.py`, `benchmarks/mock_hn.py`,
 `benchmarks/pool_exhaustion.py`.
 
-**Commit provenance.** Each JSON records the commit it was measured at. Local history was later
+**Commit provenance.** Each JSON records the commit it was measured at. Since Phase 3 it also records
+`trees` (content hashes of `src/`, `benchmarks/`, `pyproject.toml`, `uv.lock`), which survive amends
+and rebases. Local history was later
 rewritten (2026-10-17) to keep design notes out of the published repo. Code was unchanged, so the
 recorded hashes map to these published commits:
 
@@ -118,7 +120,50 @@ isn't consuming, the raw queue fills, and fetchers block. Hence ADR-0018: pool �
 Postgres) with a fixed 50 ms delay. The C = 50 result is specific to httpcore 1.0.9's pool algorithm
 and this CPU. 3 repeats per configuration.
 
+## Phase 3: reliability under injected faults (2026-10-17)
+
+Same machine. Measured at commit `30a038f`, before that commit was amended to include these results.
+Each result also records content hashes (`trees.src = 935cf7b374…`), which stay valid across amends:
+verify with `git rev-parse <commit>:src`. Mock latency 50 ms, N = 200, concurrency 20, 3 repeats.
+Retry policy: 4 attempts, full jitter (base 0.5 s, cap 10 s), Retry-After honoured (≤ 60 s).
+
+**1. No regression on a healthy source**
+([json](benchmarks/results/2026-10-17T12-39-46Z_hn_concurrent_c20_mock.json))
+
+| Run | Median duration | Throughput | Error rate |
+|---|---|---|---|
+| Phase 2, C = 20 | 0.658 s | 303.9 items/s | 0.0 |
+| Phase 3, C = 20 (retries, dead letters, transactional flush, safe flush) | **0.630 s** (0.629 / 0.630 / 0.631) | **317.7 items/s** | 0.0 |
+
+The reliability layer costs nothing measurable when nothing fails. The small improvement is within
+run-to-run noise between sessions.
+
+**2. Injected faults: 10% of item requests answer 500, 1% answer 429 with `Retry-After: 1`** (seed 7)
+
+| Retry budget | Repeat 1 | Repeat 2 | Repeat 3 | Error rate | Raw |
+|---|---|---|---|---|---|
+| 1 attempt (no retries) | failed | failed | failed | **1.0** | [json](benchmarks/results/2026-10-17T12-40-07Z_hn_concurrent_c20_faults_a1_mock.json) |
+| 4 attempts | failed (item 4: 500 ×4) | **2.285 s, 24 retries** | **4.216 s, 27 retries** | 0.333 | [json](benchmarks/results/2026-10-17T12-39-57Z_hn_concurrent_c20_faults_a4_mock.json) |
+
+**Reading the numbers**
+- **Without retries the pipeline is useless under this fault rate:** with ~200 requests at 11% failure,
+  the first non-dead-letterable failure aborts the run (fail-fast, ADR-0022). Every run failed.
+- **With retries, 2 of 3 runs ingested all 200 items**, retrying 24–27 requests (≈ 11–12% of
+  requests, matching the injected rate). It took **3.6–6.7× longer** than the healthy 0.63 s. Most of
+  that is the shared 429 gate: each `Retry-After: 1` pauses *all* fetchers for a second.
+- **The failed repeat is the retry *budget* working as designed:** one item got four 500s in a row.
+  The expected chance per 200-item run is about 200 × 0.11⁴ ≈ 3%. In an ad-hoc follow-up (a scratch
+  script, not stored as a result file) 1 of 15 runs failed the same way, with up to 3 retries logged
+  for the failing item. A run that exhausts retries fails loudly instead of writing a partial
+  dataset, and an idempotent re-run converges (ADR-0022 discusses the dead-letter-on-exhaustion alternative).
+- The harness summary takes medians over all repeats, with a failed repeat counted as 0 s / 0 items/s.
+  That's why the per-repeat columns are shown here.
+
+**Caveats:** 3 repeats per configuration, and the fault pattern is seeded but interleaving-dependent.
+The mock's faults are independent per request, while real outages are bursty and correlated.
+
 ## Planned
 
 - Phase 6: the full matrix (sequential vs 5 / 20 / 50) re-run at the end, plus one small real run,
   and possibly the httpx default-limits vs aligned-limits experiment (ADR-0019).
+- Possible: summary statistics that exclude failed repeats (success-only medians + failure count).

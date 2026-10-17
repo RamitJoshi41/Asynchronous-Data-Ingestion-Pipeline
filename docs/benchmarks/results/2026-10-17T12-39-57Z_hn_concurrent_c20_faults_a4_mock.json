@@ -1,0 +1,87 @@
+{
+  "benchmark": "hn_concurrent",
+  "phase": 3,
+  "started_at": "2026-10-17T12:39:57.722241+00:00",
+  "machine": {
+    "platform": "Linux-6.8.0-138-generic-x86_64-with-glibc2.35",
+    "python": "3.12.13",
+    "cpu": "11th Gen Intel(R) Core(TM) i5-11400H @ 2.70GHz",
+    "cpu_count": 12
+  },
+  "commit": "30a038f1318d603569cc5985cae24512b0f15046",
+  "dirty": false,
+  "trees": {
+    "src": "935cf7b37477dc15a54620daea30682626035e2e",
+    "benchmarks": "9ff125fbc0003fcc3e8c56c6b6dd2b6ae29077f7",
+    "pyproject.toml": "1bedcdf436eadb9d419747be8835ec2ba76b916d",
+    "uv.lock": "5c72c00fe916a584a298903c21c0423f6314d69e"
+  },
+  "params": {
+    "target": "mock",
+    "mode": "concurrent",
+    "items": 200,
+    "repeats": 3,
+    "retry_max_attempts": 4,
+    "latency_ms": 50.0,
+    "fail_rate": 0.1,
+    "rate_limit_rate": 0.01,
+    "seed": 7,
+    "concurrency": 20,
+    "workers": 2,
+    "batch_size": 50,
+    "flush_interval_s": 1.0,
+    "raw_queue_maxsize": 100
+  },
+  "repeats": [
+    {
+      "duration_s": 0.0,
+      "items_requested": 200,
+      "ingested": 0,
+      "invalid": 0,
+      "missing": 0,
+      "failed": true,
+      "error": "ExceptionGroup('unhandled errors in a TaskGroup', [ExceptionGroup('unhandled errors in a TaskGroup', [HTTPStatusError(\"Server error '500 Internal Server Error' for url 'http://127.0.0.1:56823/v0/item/4.json'\\nFor more information check: https://developer.mozilla.org/en-US/docs/Web/HTTP/Status/500\")]",
+      "client_cpu_s": 0.0,
+      "peak_in_flight": 0,
+      "blocked_puts": 0,
+      "flushes": 0,
+      "retries": 0,
+      "items_per_s": 0.0
+    },
+    {
+      "duration_s": 2.285310244998982,
+      "items_requested": 200,
+      "ingested": 200,
+      "invalid": 0,
+      "missing": 0,
+      "failed": false,
+      "error": null,
+      "client_cpu_s": 0.299621852,
+      "peak_in_flight": 20,
+      "blocked_puts": 0,
+      "flushes": 6,
+      "retries": 24,
+      "items_per_s": 87.51546991821633
+    },
+    {
+      "duration_s": 4.21633552899948,
+      "items_requested": 200,
+      "ingested": 200,
+      "invalid": 0,
+      "missing": 0,
+      "failed": false,
+      "error": null,
+      "client_cpu_s": 0.3690948030000001,
+      "peak_in_flight": 20,
+      "blocked_puts": 0,
+      "flushes": 8,
+      "retries": 27,
+      "items_per_s": 47.43455510701712
+    }
+  ],
+  "summary": {
+    "median_duration_s": 2.285310244998982,
+    "median_items_per_s": 47.43455510701712,
+    "error_rate": 0.3333333333333333
+  }
+}
