@@ -1,9 +1,11 @@
 import json
+import time
 
 import asyncpg
 import pytest
 
-from ingest.db import DbPool
+from ingest.config import Settings
+from ingest.db import DbPool, create_pool
 from ingest.storage import MAX_ERROR_CHARS, RunCounts, RunStatus, Store, UpsertOutcome
 
 T = 5.0
@@ -121,3 +123,64 @@ def test_run_counts_record_outcomes() -> None:
         counts.record(outcome)
     counts.record(UpsertOutcome.UPDATED)
     assert (counts.inserted, counts.updated, counts.unchanged) == (2, 1, 1)
+
+
+async def test_batch_upsert_reports_outcome_per_key(store: Store, migrated_pool: DbPool) -> None:
+    run1 = await store.start_run("hacker_news")
+    first = await store.upsert_items(run1, "hacker_news", [("1", '{"v": 1}'), ("2", '{"v": 2}')])
+    assert first == {"1": UpsertOutcome.INSERTED, "2": UpsertOutcome.INSERTED}
+    before = await item_row(migrated_pool, "hacker_news", "1")
+
+    run2 = await store.start_run("hacker_news")
+    second = await store.upsert_items(
+        run2, "hacker_news", [("1", '{"v": 1}'), ("2", '{"v": 22}'), ("3", "{}")]
+    )
+    assert second == {
+        "1": UpsertOutcome.UNCHANGED,
+        "2": UpsertOutcome.UPDATED,
+        "3": UpsertOutcome.INSERTED,
+    }
+    # The unchanged row inside a batch is also not rewritten.
+    assert (await item_row(migrated_pool, "hacker_news", "1"))["xmin"] == before["xmin"]
+    assert (await item_row(migrated_pool, "hacker_news", "2"))["last_changed_run_id"] == run2
+
+
+async def test_batch_duplicates_are_collapsed_last_wins(
+    store: Store, migrated_pool: DbPool
+) -> None:
+    # Without de-duplication Postgres rejects the whole statement (CardinalityViolationError).
+    run_id = await store.start_run("hacker_news")
+    outcome = await store.upsert_items(
+        run_id, "hacker_news", [("9", '{"v": "old"}'), ("9", '{"v": "new"}')]
+    )
+    assert outcome == {"9": UpsertOutcome.INSERTED}
+    row = await item_row(migrated_pool, "hacker_news", "9")
+    assert json.loads(row["payload"]) == {"v": "new"}
+
+
+async def test_empty_batch_is_a_no_op(store: Store) -> None:
+    run_id = await store.start_run("hacker_news")
+    assert await store.upsert_items(run_id, "hacker_news", []) == {}
+
+
+async def test_undersized_pool_flush_times_out_instead_of_hanging(
+    test_settings: Settings, schema: str, migrated_pool: DbPool
+) -> None:
+    # Deliberate pool exhaustion (ADR-0018): a pool of ONE connection, already borrowed by
+    # "another worker". The next flush must fail within the acquire timeout, not wait forever.
+    tiny = test_settings.model_copy(update={"db_pool_min_size": 1, "db_pool_max_size": 1})
+    tiny_pool = await create_pool(tiny, search_path=schema)
+    try:
+        store = Store(tiny_pool, acquire_timeout=0.2)
+        async with tiny_pool.acquire() as busy_worker_conn:
+            assert busy_worker_conn is not None
+            started = time.perf_counter()
+            with pytest.raises(TimeoutError):
+                await store.upsert_items(1, "hacker_news", [("1", "{}")])
+            assert time.perf_counter() - started < 1.0
+    finally:
+        await tiny_pool.close()
+
+
+def test_store_reports_pool_max_size(store: Store, test_settings: Settings) -> None:
+    assert store.pool_max_size == test_settings.db_pool_max_size

@@ -5,6 +5,7 @@ imports a source model. Every connection is acquired with an explicit timeout (a
 `Pool.execute` shortcuts acquire without one). Explainer: docs/explain/ingest/storage.md
 """
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 
@@ -25,6 +26,21 @@ ON CONFLICT (source, source_id) DO UPDATE
         last_changed_run_id = EXCLUDED.last_changed_run_id
     WHERE items.payload IS DISTINCT FROM EXCLUDED.payload
 RETURNING (xmax = 0) AS inserted
+"""
+
+# Batch form of _UPSERT (ADR-0017): one round trip per batch. unnest() turns the two parallel
+# arrays into rows. RETURNING yields only inserted/updated rows, so a key that is absent from the
+# result was unchanged. Keys must be unique within one batch (see upsert_items).
+_UPSERT_BATCH = """
+INSERT INTO items (source, source_id, payload, last_changed_run_id)
+SELECT $1, batch.source_id, batch.payload, $4
+FROM unnest($2::text[], $3::jsonb[]) AS batch (source_id, payload)
+ON CONFLICT (source, source_id) DO UPDATE
+    SET payload = EXCLUDED.payload,
+        updated_at = now(),
+        last_changed_run_id = EXCLUDED.last_changed_run_id
+    WHERE items.payload IS DISTINCT FROM EXCLUDED.payload
+RETURNING source_id, (xmax = 0) AS inserted
 """
 
 _START_RUN = "INSERT INTO ingestion_runs (source, status) VALUES ($1, 'running') RETURNING id"
@@ -76,6 +92,10 @@ class Store:
         self._pool = pool
         self._acquire_timeout = acquire_timeout
 
+    @property
+    def pool_max_size(self) -> int:
+        return self._pool.get_max_size()
+
     async def start_run(self, source: str) -> int:
         async with self._pool.acquire(timeout=self._acquire_timeout) as conn:
             run_id = await conn.fetchval(_START_RUN, source)
@@ -112,3 +132,24 @@ class Store:
         if row is None:
             return UpsertOutcome.UNCHANGED
         return UpsertOutcome.INSERTED if row["inserted"] else UpsertOutcome.UPDATED
+
+    async def upsert_items(
+        self, run_id: int, source: str, records: Sequence[tuple[str, str]]
+    ) -> dict[str, UpsertOutcome]:
+        """Upsert `(source_id, payload_json)` pairs in ONE statement; return the outcome per key.
+
+        Duplicate keys in one batch would make Postgres reject the whole statement
+        (CardinalityViolationError), so they are collapsed first: the last payload wins.
+        """
+        latest = dict(records)  # keeps first-seen key order, last-seen value
+        if not latest:
+            return {}
+        async with self._pool.acquire(timeout=self._acquire_timeout) as conn:
+            rows = await conn.fetch(
+                _UPSERT_BATCH, source, list(latest), list(latest.values()), run_id
+            )
+        written = {
+            r["source_id"]: UpsertOutcome.INSERTED if r["inserted"] else UpsertOutcome.UPDATED
+            for r in rows
+        }
+        return {key: written.get(key, UpsertOutcome.UNCHANGED) for key in latest}
