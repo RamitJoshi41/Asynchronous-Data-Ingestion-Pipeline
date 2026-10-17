@@ -66,6 +66,22 @@ class PipelineConfig:
         )
 
 
+def settings_for(settings: Settings, cfg: PipelineConfig) -> Settings:
+    """Settings consistent with a (possibly overridden) config, for building the client and pool.
+
+    httpx limits come from `fetch_concurrency` (ADR-0019) and the pool must be >= workers + 1
+    (ADR-0018). If a caller overrides the config but builds resources from the original settings,
+    httpx's pool silently caps concurrency or flushes exhaust the DB pool.
+    """
+    return settings.model_copy(
+        update={
+            "fetch_concurrency": cfg.concurrency,
+            "pipeline_workers": cfg.workers,
+            "db_pool_max_size": max(settings.db_pool_max_size, cfg.workers + 1),
+        }
+    )
+
+
 @dataclass
 class PipelineStats:
     """Concurrency facts about one run (logged, returned, asserted by tests)."""
