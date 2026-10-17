@@ -6,8 +6,9 @@ CLAUDE.md already fixes the shape of.
 """
 
 from functools import lru_cache
+from typing import Self
 
-from pydantic import Field, SecretStr
+from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -26,9 +27,9 @@ class Settings(BaseSettings):
         default=SecretStr("postgresql://ingest:ingest@localhost:5433/ingest"),
         description="PostgreSQL connection string (local-dev default; override via DB_DSN).",
     )
-    # Sequential Phase 1 uses one connection at a time; sizing is revisited in Phase 2's ADR.
+    # Must cover one concurrent flush per worker plus one for run bookkeeping (ADR-0018).
     db_pool_min_size: int = Field(default=1, ge=1)
-    db_pool_max_size: int = Field(default=2, ge=1)
+    db_pool_max_size: int = Field(default=3, ge=1)
     db_connect_timeout_s: float = Field(default=5.0, gt=0)
     db_acquire_timeout_s: float = Field(default=5.0, gt=0)
     db_command_timeout_s: float = Field(default=10.0, gt=0)
@@ -38,6 +39,14 @@ class Settings(BaseSettings):
     http_read_timeout_s: float = Field(default=10.0, gt=0)
     http_write_timeout_s: float = Field(default=10.0, gt=0)
     http_pool_timeout_s: float = Field(default=5.0, gt=0)
+
+    # --- Concurrent pipeline (Phase 2; ADR-0014..0016) ---------------------------------------
+    fetch_concurrency: int = Field(default=10, ge=1, le=200)  # fixed fetcher pool size
+    pipeline_workers: int = Field(default=2, ge=1, le=32)
+    batch_size: int = Field(default=50, ge=1, le=1000)
+    flush_interval_s: float = Field(default=1.0, gt=0)
+    id_queue_maxsize: int = Field(default=100, ge=1)  # 0 would mean unbounded in asyncio
+    raw_queue_maxsize: int = Field(default=100, ge=1)
 
     # --- Hacker News -----------------------------------------------------------------------
     hn_base_url: str = Field(default="https://hacker-news.firebaseio.com/v0")
@@ -49,6 +58,16 @@ class Settings(BaseSettings):
         default=None,
         description="GitHub personal access token (GITHUB_TOKEN). Never commit it.",
     )
+
+    @model_validator(mode="after")
+    def _pool_fits_workers(self) -> Self:
+        # Fail at startup, not as acquire timeouts mid-run (pool exhaustion, ADR-0018).
+        if self.db_pool_max_size < self.pipeline_workers + 1:
+            raise ValueError(
+                f"db_pool_max_size ({self.db_pool_max_size}) must be >= pipeline_workers + 1 "
+                f"({self.pipeline_workers + 1}): one connection per flushing worker + bookkeeping"
+            )
+        return self
 
 
 @lru_cache

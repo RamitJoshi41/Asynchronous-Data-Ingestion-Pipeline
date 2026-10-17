@@ -63,6 +63,12 @@ def test_default_dsn_targets_compose_db_port() -> None:
         ("DB_POOL_MAX_SIZE", "0"),
         ("HTTP_READ_TIMEOUT_S", "0"),
         ("DB_COMMAND_TIMEOUT_S", "-1"),
+        ("FETCH_CONCURRENCY", "0"),
+        ("FETCH_CONCURRENCY", "201"),
+        ("BATCH_SIZE", "0"),
+        ("FLUSH_INTERVAL_S", "0"),
+        ("RAW_QUEUE_MAXSIZE", "0"),  # asyncio would treat 0 as unbounded
+        ("ID_QUEUE_MAXSIZE", "0"),
     ],
 )
 def test_out_of_range_values_fail_at_startup(
@@ -77,3 +83,17 @@ def test_numeric_env_strings_are_converted(monkeypatch: pytest.MonkeyPatch) -> N
     # Env vars are always strings; settings fields are lax so "45" becomes 45.
     monkeypatch.setenv("HN_TOP_LIMIT", "45")
     assert Settings(_env_file=None).hn_top_limit == 45
+
+
+def test_pool_must_fit_workers_plus_bookkeeping(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("PIPELINE_WORKERS", "4")
+    monkeypatch.setenv("DB_POOL_MAX_SIZE", "4")  # needs 5
+    with pytest.raises(ValidationError, match="pipeline_workers \\+ 1"):
+        Settings(_env_file=None)
+    monkeypatch.setenv("DB_POOL_MAX_SIZE", "5")
+    assert Settings(_env_file=None).pipeline_workers == 4
+
+
+def test_pipeline_defaults_are_consistent() -> None:
+    s = Settings(_env_file=None)
+    assert s.db_pool_max_size >= s.pipeline_workers + 1

@@ -6,7 +6,7 @@ import respx
 from pydantic import ValidationError
 
 from ingest.config import Settings
-from ingest.httpclient import USER_AGENT, build_http_client
+from ingest.httpclient import USER_AGENT, build_http_client, http_limits
 from ingest.sources.hn import fetch_item, fetch_top_ids
 
 BASE = "https://hn.test/v0"  # never the real API: respx fails any unmocked request
@@ -79,3 +79,9 @@ async def test_client_has_all_four_timeouts_from_settings() -> None:
     async with build_http_client(settings) as c:
         assert c.timeout == httpx.Timeout(connect=1.5, read=2.5, write=3.5, pool=4.5)
         assert c.follow_redirects is False
+
+
+def test_http_limits_match_fetch_concurrency() -> None:
+    limits = http_limits(Settings(_env_file=None, fetch_concurrency=37))
+    # Keep-alive equal to max connections: no reconnect churn at full concurrency.
+    assert limits == httpx.Limits(max_connections=37, max_keepalive_connections=37)
