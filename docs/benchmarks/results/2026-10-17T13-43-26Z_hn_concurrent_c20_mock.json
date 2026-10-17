@@ -1,0 +1,87 @@
+{
+  "benchmark": "hn_concurrent",
+  "phase": 4,
+  "started_at": "2026-10-17T13:43:26.953681+00:00",
+  "machine": {
+    "platform": "Linux-6.8.0-138-generic-x86_64-with-glibc2.35",
+    "python": "3.12.13",
+    "cpu": "11th Gen Intel(R) Core(TM) i5-11400H @ 2.70GHz",
+    "cpu_count": 12
+  },
+  "commit": "95847d9a25744f48a002024692f9faef2768abf4",
+  "dirty": false,
+  "trees": {
+    "src": "78dbf77c9aed1b3fb4b4954fe798cedec59fe378",
+    "benchmarks": "a5d1f217d4d6e04a77a6949778dea984165e0257",
+    "pyproject.toml": "1bedcdf436eadb9d419747be8835ec2ba76b916d",
+    "uv.lock": "5c72c00fe916a584a298903c21c0423f6314d69e"
+  },
+  "params": {
+    "target": "mock",
+    "mode": "concurrent",
+    "items": 200,
+    "repeats": 3,
+    "retry_max_attempts": 4,
+    "latency_ms": 50.0,
+    "fail_rate": 0.0,
+    "rate_limit_rate": 0.0,
+    "seed": 0,
+    "concurrency": 20,
+    "workers": 2,
+    "batch_size": 50,
+    "flush_interval_s": 1.0,
+    "raw_queue_maxsize": 100
+  },
+  "repeats": [
+    {
+      "duration_s": 0.6506322380009806,
+      "items_requested": 200,
+      "ingested": 200,
+      "invalid": 0,
+      "missing": 0,
+      "failed": false,
+      "error": null,
+      "client_cpu_s": 0.24230479000000002,
+      "peak_in_flight": 20,
+      "blocked_puts": 0,
+      "flushes": 5,
+      "retries": 0,
+      "items_per_s": 307.39331425458596
+    },
+    {
+      "duration_s": 0.6559089309994306,
+      "items_requested": 200,
+      "ingested": 200,
+      "invalid": 0,
+      "missing": 0,
+      "failed": false,
+      "error": null,
+      "client_cpu_s": 0.27342868299999995,
+      "peak_in_flight": 20,
+      "blocked_puts": 0,
+      "flushes": 5,
+      "retries": 0,
+      "items_per_s": 304.92037925943964
+    },
+    {
+      "duration_s": 0.6300579169983394,
+      "items_requested": 200,
+      "ingested": 200,
+      "invalid": 0,
+      "missing": 0,
+      "failed": false,
+      "error": null,
+      "client_cpu_s": 0.22795398199999994,
+      "peak_in_flight": 20,
+      "blocked_puts": 0,
+      "flushes": 5,
+      "retries": 0,
+      "items_per_s": 317.4311354626263
+    }
+  ],
+  "summary": {
+    "median_duration_s": 0.6506322380009806,
+    "median_items_per_s": 307.39331425458596,
+    "error_rate": 0.0
+  }
+}

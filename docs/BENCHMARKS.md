@@ -14,13 +14,15 @@ recorded hashes map to these published commits:
 |---|---|---|
 | `ef7bab9` | `d02f9c4` | benchmark harness skeleton (Phase 1 results) |
 | `97f0bc9` | `ad43183` | concurrent mode + pool experiment (Phase 2 results) |
+| `95847d9` | the Phase 4 commit (amended to add these results; trees identical: `src` 78dbf77, `benchmarks` a5d1f21) | Phase 4 regression results |
 
 ## Methodology
 
 - **Workload:** Hacker News top stories. Fetch the id list, then for each id: GET the item →
   strict Pydantic validation → skip-unchanged upsert into Postgres. Sequential mode writes one row
   per statement. Concurrent mode (Phase 2) uses C fetchers, W workers, and batched `unnest()` upserts.
-- **Timing:** wall time of `run_hn_sequential` / `run_hn_concurrent` (`time.perf_counter`),
+- **Timing:** wall time of `run_hn_sequential` / `run_hn_concurrent` (Phase 4: `run_sequential` /
+  `run_concurrent` with the HN connector) (`time.perf_counter`),
   covering fetching, validating, and writing. It excludes pool creation and migrations. Phase 2 also
   records the **client process CPU time** (`time.process_time`) to tell waiting from working.
 - **Starting state:** every repeat writes into a fresh, empty schema, so every item takes the insert path.
@@ -161,6 +163,28 @@ run-to-run noise between sessions.
 
 **Caveats:** 3 repeats per configuration, and the fault pattern is seeded but interleaving-dependent.
 The mock's faults are independent per request, while real outages are bursty and correlated.
+
+## Phase 4: regression check after the connector refactor (2026-10-17)
+
+Phase 4 made the pipeline generic (HN now runs through `HackerNewsConnector`: jobs → async-generator
+pages → records). Question: did the abstraction cost throughput? Same mock, 200 items, 50 ms latency,
+measured at commit `95847d9` (clean tree), with content hashes recorded in the JSON.
+
+| Run | Repeats (s) | Median | Throughput | Client CPU (s) | Raw |
+|---|---|---|---|---|---|
+| Phase 3, C = 20 | 0.630 / 0.629 / 0.631 | 0.630 s | 317.7 items/s | 0.20–0.22 | (Phase 3 file) |
+| Phase 4, C = 20, set 1 | 0.651 / 0.656 / 0.630 | **0.651 s** | 307.4 items/s | 0.23–0.27 | [json](benchmarks/results/2026-10-17T13-43-26Z_hn_concurrent_c20_mock.json) |
+| Phase 4, C = 20, set 2 | 0.627 / 0.673 / 0.621 | **0.627 s** | 319.2 items/s | 0.19–0.26 | [json](benchmarks/results/2026-10-17T13-44-30Z_hn_concurrent_c20_mock.json) |
+| Phase 2, sequential | 11.577 / 11.564 / 11.641 | 11.577 s | 17.3 items/s | 0.79–0.83 | (Phase 2 file) |
+| Phase 4, sequential | 11.479 / 11.304 / 11.235 | **11.304 s** | 17.7 items/s | 0.57–0.70 | [json](benchmarks/results/2026-10-17T13-43-33Z_hn_sequential_mock.json) |
+
+**Reading the numbers:** the two Phase 4 C = 20 sets (0.651 and 0.627 s) bracket Phase 3's 0.630 s, and
+their spread (0.621–0.673 s) is larger than the difference, so there's **no measurable cost** at this
+resolution. Client CPU may be marginally higher (async-generator steps per page), within noise. The
+sequential baseline now builds its client with `concurrency=1` (it was the default 10 before), which
+doesn't matter for one request at a time. GitHub and Open-Meteo aren't benchmarked: their runs are
+quota-bound (GitHub 60 req/h unauthenticated), not throughput-bound. Their real smoke runs (600 issues,
+21 forecast rows, JOURNAL) are functional checks, not measurements.
 
 ## Planned
 

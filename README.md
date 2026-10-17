@@ -1,31 +1,38 @@
 # PipeLine: async data ingestion pipeline
 
-A headless Python 3.12 service that ingests data from a fixed set of public APIs (Hacker News, and
-later GitHub and Open-Meteo). It validates every record with strict Pydantic v2 schemas,
+A headless Python 3.12 service that ingests data from a fixed set of public APIs (Hacker News, GitHub
+and Open-Meteo). It validates every record with strict Pydantic v2 schemas,
 upserts clean rows into PostgreSQL (skipping unchanged rows), records every run, and is being built
 up phase by phase into a concurrent, failure-tolerant pipeline with a small FastAPI status layer.
 
-> **Status: Phase 3 of 6.** Hacker News works end to end, concurrently and **reliably**: retries with
-> jitter and Retry-After, a dead-letter table with replay, and graceful Ctrl-C/SIGTERM drain. More
-> sources (GitHub, Open-Meteo), metrics and the API are *planned*.
+> **Status: Phase 4 of 6.** Three sources (Hacker News, GitHub issues/PRs, Open-Meteo forecasts) run
+> through one source-agnostic, concurrent, reliable pipeline, each with its own limits; GitHub is
+> incremental via watermarks. Metrics and the API are *planned*.
 
 ## Architecture
 
-**Now (Phase 3):**
+**Now (Phase 4):**
 
 ```mermaid
 flowchart LR
-    CLI["python -m ingest run hn<br/>Ctrl-C: 1st drain, 2nd cancel"] --> R["run_hn_concurrent()"]
-    R -- "start / finish (shielded)" --> RUNS[("ingestion_runs<br/>succeeded · failed · cancelled<br/>retries, kind")]
-    R --> FEED["feeder<br/>(stops on SIGINT/SIGTERM)"] --> IDQ[("id_queue<br/>bounded")]
-    IDQ --> F["C fetchers<br/>Retrier: full jitter + Retry-After<br/>shared 429 gate"]
-    F -- "GET /item/id.json" --> HN[Hacker News API]
-    F -- "bytes | http_4xx reject" --> RAWQ[("raw_queue<br/>bounded")]
-    RAWQ --> W["W workers<br/>classify_hn_body (strict)"]
-    W -- "flush: ONE transaction<br/>(shielded, awaited on shutdown)" --> TX{{"upsert items (skip unchanged)<br/>resolve their dead letters<br/>upsert rejects"}}
+    CLI["python -m ingest run hn|github|open-meteo|all<br/>Ctrl-C: 1st drain all, 2nd cancel"] --> RS["runner.run_sources()<br/>one DB pool Σ(W+1), one StopSignal"]
+    RS --> P1["run_concurrent(HN connector)<br/>own httpx client, C=10"]
+    RS --> P2["run_concurrent(GitHub connector)<br/>own client + token, C=2"]
+    RS --> P3["run_concurrent(Open-Meteo connector)<br/>own client, C=2"]
+    subgraph PIPE["each pipeline instance (same core code)"]
+        PLAN["connector.plan(watermarks)"] --> JQ[("job_queue<br/>bounded")]
+        JQ --> F["C fetchers<br/>job_pages: pages in order<br/>Retrier + connector rate-limit hook"]
+        F --> RQ[("raw_queue<br/>pages, bounded")]
+        RQ --> W["W workers<br/>classify: connector.parse<br/>exact batch_size chunks"]
+    end
+    P2 -.-> PIPE
+    F -- "GET (Link next, same-origin only)" --> API["HN · GitHub · Open-Meteo"]
+    W -- "flush: ONE transaction" --> TX{{"upsert items (skip unchanged)<br/>resolve dead letters<br/>upsert rejects"}}
     TX --> ITEMS[("items")]
-    TX --> DLQ[("dead_letter<br/>raw bytea + errors<br/>one open row per record")]
-    REPLAY["python -m ingest replay"] -- "re-validate stored bodies" --> TX
+    TX --> DLQ[("dead_letter")]
+    PIPE -- "succeeded only, same txn as status" --> WM[("source_watermarks<br/>per (source, key)")]
+    WM -. "since=" .-> PLAN
+    PIPE --> RUNS[("ingestion_runs<br/>one row per source per run")]
 ```
 
 **Target (planned):**
@@ -67,8 +74,11 @@ flowchart LR
 | Dead-letter table (raw bytes + errors, one open row per record) written atomically with each batch; auto-resolve on clean re-ingest | Done (Phase 3) |
 | `replay`: re-validate dead letters against the current model | Done (Phase 3) |
 | Graceful shutdown: Ctrl-C/SIGTERM drains and records `cancelled` (exit 130); 2nd signal forces; cancellation-safe flushes | Done (Phase 3) |
-| Retries with jitter, `Retry-After`, dead-letter + replay, graceful shutdown | Planned: Phase 3 |
-| GitHub + Open-Meteo, per-source limits, watermarks | Planned: Phase 4 |
+| Connector protocol: the core (queues, workers, storage, retries) never imports a source; enforced by a test | Done (Phase 4) |
+| GitHub: issues + PRs per repo, token auth, `Link` pagination, `x-ratelimit-*` handling | Done (Phase 4) |
+| Open-Meteo: daily forecast per city (added without touching core code) | Done (Phase 4) |
+| Watermarks: advanced only by a succeeded run, in the same transaction; GitHub resumes with `since` | Done (Phase 4) |
+| Per-source concurrency + HTTP client; `run all` with failure isolation | Done (Phase 4) |
 | Metrics, FastAPI endpoints, overlap guard | Planned: Phase 5 |
 | One-command Docker Compose run, CI | Planned: Phase 6 |
 
@@ -81,8 +91,11 @@ uv sync                                   # .venv with runtime + dev deps
 docker compose up -d --wait db            # Postgres 16 on localhost:5433
 uv run python -m ingest migrate           # create/upgrade tables
 uv run python -m ingest run hn --limit 30 --concurrency 5   # concurrent (default mode)
+uv run python -m ingest run github                          # GITHUB_TOKEN optional (60 req/h without)
+uv run python -m ingest run open-meteo
+uv run python -m ingest run all                             # every source at once, each with its own limits
 uv run python -m ingest run hn --limit 30 --sequential      # Phase 1 baseline runner
-uv run python -m ingest replay                              # re-validate dead letters after a model fix
+uv run python -m ingest replay                              # re-validate dead letters (all sources)
 uv run python -m ingest.toy_pipeline      # Phase 0 concurrency simulation
 ```
 
@@ -101,18 +114,24 @@ Environment variables (or a git-ignored `.env` in the working directory), define
 | `DB_ACQUIRE_TIMEOUT_S` | `5` | waiting for a free pooled connection |
 | `DB_COMMAND_TIMEOUT_S` | `10` | per SQL statement |
 | `HTTP_CONNECT_TIMEOUT_S` / `HTTP_READ_TIMEOUT_S` / `HTTP_WRITE_TIMEOUT_S` / `HTTP_POOL_TIMEOUT_S` | `5` / `10` / `10` / `5` | httpx timeouts |
-| `FETCH_CONCURRENCY` | `10` (1–200) | fixed fetcher pool size; httpx connection limits follow it |
-| `PIPELINE_WORKERS` | `2` (1–32) | validating/flushing workers |
+| `PIPELINE_WORKERS` | `2` (1–32) | validating/flushing workers (per source) |
 | `BATCH_SIZE` | `50` (1–1000) | rows per upsert statement |
 | `FLUSH_INTERVAL_S` | `1.0` | max time a buffered record waits before being written |
-| `ID_QUEUE_MAXSIZE` / `RAW_QUEUE_MAXSIZE` | `100` / `100` (≥ 1) | queue bounds (backpressure) |
+| `JOB_QUEUE_MAXSIZE` / `RAW_QUEUE_MAXSIZE` | `100` / `100` (≥ 1) | queue bounds (backpressure) |
 | `RETRY_MAX_ATTEMPTS` | `4` (1–10) | total tries per request (1 = no retries) |
 | `RETRY_BASE_DELAY_S` / `RETRY_MAX_DELAY_S` | `0.5` / `10` | full-jitter backoff window |
 | `RETRY_AFTER_MAX_S` | `60` | a longer `Retry-After` gives up instead of stalling |
 | `SHUTDOWN_GRACE_S` | `10` | drain deadline after SIGINT/SIGTERM |
 | `HN_BASE_URL` | `https://hacker-news.firebaseio.com/v0` | HN API base |
 | `HN_TOP_LIMIT` | `30` (1–500) | default number of top stories |
-| `GITHUB_TOKEN` | unset | GitHub token (Phase 4; secret) |
+| `HN_CONCURRENCY` | `10` (1–200) | HN fetcher pool size (httpx limits follow it) |
+| `GITHUB_TOKEN` | unset | GitHub token (secret; sent only to GitHub) |
+| `GITHUB_REPOS` | `["encode/httpx", "MagicStack/asyncpg"]` | JSON list of `owner/repo` |
+| `GITHUB_MAX_PAGES` | `3` (1–100) | pages (×100 issues) per repo per run |
+| `GITHUB_CONCURRENCY` | `2` (1–20) | GitHub fetcher pool size |
+| `GITHUB_API_VERSION` / `GITHUB_BASE_URL` | `2022-11-28` / `https://api.github.com` | |
+| `OPEN_METEO_CITIES` | `["patiala:30.34:76.39", "delhi:28.61:77.21", "london:51.51:-0.13"]` | JSON list of `name:lat:lon` |
+| `OPEN_METEO_CONCURRENCY` / `OPEN_METEO_BASE_URL` | `2` / `https://api.open-meteo.com/v1` | |
 
 ## API endpoints
 
@@ -122,9 +141,11 @@ already active). Until then, inspect runs in SQL:
 
 ## Adding a source
 
-Planned for Phase 4. The storage layer is already source-agnostic (`items(source, source_id,
-payload jsonb)`), so the goal is that a new source is a connector plus a Pydantic model, with no
-changes to storage, queue, or worker code.
+A source is a connector (a class satisfying the small `Connector` protocol in
+`src/ingest/connector.py`: `plan`, `pages`, `parse`, `revalidate`, `rate_limit_delay`), a strict
+Pydantic model, a settings block and one registry entry. Queue, worker, storage, retry and shutdown code
+doesn't change: `tests/test_architecture.py` fails if core code imports a connector, and Open-Meteo was
+added with a diff of 5 files, 344 insertions, 0 deletions.
 
 ## Testing
 
@@ -150,6 +171,7 @@ Local mock with 50 ms injected latency, 200 items, 3 repeats, medians:
 | concurrent, C = 20 | 0.658 s | 303.9 items/s | 17.6× | 0 |
 | concurrent, C = 50 | 0.826 s | 242.1 items/s | 14.0× | 0 |
 | concurrent, C = 20, Phase 3 reliability layer | 0.630 s | 317.7 items/s | 18.4× | 0 |
+| concurrent, C = 20, Phase 4 connector refactor (two sets) | 0.651 s / 0.627 s | 307.4 / 319.2 items/s | 17.8× / 18.5× | 0 |
 
 C = 50 is *slower* than C = 20: the client becomes CPU-bound in httpcore's connection-pool
 bookkeeping (O(connections²) per request event, found by profiling).
@@ -160,6 +182,9 @@ and one failed when a single item hit four 500s in a row (≈3% expected per run
 
 Real HN API, one run each: sequential 30 items in 12.762 s vs concurrent C = 5 in 3.931 s (different
 times of day, so indicative only). Mock numbers describe this laptop with a fixed artificial delay.
+
+After the Phase 4 refactor the sequential baseline measured 11.304 s (17.7 items/s): no measurable cost
+from the connector abstraction. The new sources aren't benchmarked yet (Phase 6).
 
 ## Failure modes
 
@@ -185,6 +210,12 @@ times of day, so indicative only). Mock numbers describe this laptop with a fixe
 | Duplicate key within one batch | de-duplication | last payload wins (Postgres would reject the whole statement) | `test_batch_duplicates_are_collapsed_last_wins` |
 | Ctrl-C / SIGTERM | signal handler | **drain**: stop feeding, finish in-flight, flush all buffers, run `cancelled`, exit 130 | `test_sigint_drains_and_records_cancelled_run` (real subprocess + SIGINT) |
 | Drain too slow | deadline (`SHUTDOWN_GRACE_S`) | remaining work cancelled, run `cancelled` with reason | `test_drain_past_deadline_is_cut_short_but_still_recorded` |
+| GitHub rate limit (403/429, `x-ratelimit-remaining: 0`) | connector hook | wait until reset (≤ 60 s) with all GitHub fetchers paused; longer → run fails fast, watermark unchanged | `test_primary_rate_limit_waits_until_reset_then_succeeds`, `test_primary_rate_limit_reset_far_away_fails_fast` |
+| Repo private / gone (plain 403/404) | non-retryable status | dead letter keyed `owner/repo`, that repo's watermark held, others continue | `test_plain_403_dead_letters_that_repo_and_holds_its_watermark` |
+| Page isn't the expected envelope (HTML, error object) | `InvalidPage` | `invalid_page` dead letter, watermark held | `test_unreadable_page_dead_letters_and_holds_that_repos_watermark` |
+| Run crashes / fails / is cancelled | no succeeded status | watermark unchanged; next run re-reads the overlap, skip-unchanged makes it free | `test_failed_run_leaves_every_watermark_unchanged`, `test_watermark_and_succeeded_status_commit_together` |
+| One source fails during `run all` | per-source isolation | other sources finish; exit code 1 | `test_a_failing_source_does_not_cancel_the_others` |
+| `Link` header points to another host | same-origin check | refused (token never leaves GitHub) | `test_a_link_to_another_host_is_refused`, `test_the_token_is_never_sent_to_another_host` |
 | Second Ctrl-C | signal handler | immediate cancel; the in-progress batch still lands and is counted; `cancelled` | `test_second_sigint_forces_immediate_exit`, `test_forced_cancellation_lets_the_in_progress_batch_land` |
 
 
@@ -197,7 +228,10 @@ times of day, so indicative only). Mock numbers describe this laptop with a fixe
   `running` row.
 - Signal handling uses `loop.add_signal_handler`, which is Unix-only (Linux/macOS/Docker).
 - A single `httpx.AsyncClient` stops scaling at about 20 connections on this laptop (httpcore pool overhead).
+- GitHub backfills oldest-first at `GITHUB_MAX_PAGES` × 100 issues per repo per run. A primary rate-limit
+  reset more than 60 s away fails the run rather than waiting. A drained run advances no watermark.
 - Benchmarks so far describe one laptop (mock) and one moment of the internet (real).
+- Weather data by [Open-Meteo.com](https://open-meteo.com/) (CC BY 4.0), used on its free, non-commercial tier.
 - Non-goals: a universal "any API" connector, scraping, anti-bot evasion, a UI, auth/multi-tenancy,
   Kafka/Celery/Airflow.
 
@@ -205,20 +239,21 @@ times of day, so indicative only). Mock numbers describe this laptop with a fixe
 
 ```
 src/ingest/
-  __main__.py        CLI (migrate, run hn)
-  config.py          settings from env
-  db.py              asyncpg pool
-  migrate.py         migration runner;  migrations/*.sql  the schema
-  httpclient.py      shared httpx client
-  sources/hn.py      HN HTTP calls
-  models/hn.py       strict HNItem schema
-  storage.py         items upsert + ingestion_runs
-  records.py         shared per-record rules: fetch with retries, classify, dead letters
-  retry.py           backoff with full jitter, Retry-After, rate-limit gate
+  __main__.py        CLI (migrate, run hn|github|open-meteo|all, replay)
+  config.py          settings from env (one block per source)
+  connector.py       the connector contract (Job, Page, Record, Connector protocol)
+  connectors/        hn.py, github.py, open_meteo.py, registry.py
+  models/            strict schemas: hn.py, github.py, open_meteo.py
+  runner.py          runs sources: per-source clients, sized DB pool, signals
+  pipeline.py        concurrent runner (any connector)
+  sequential.py      one-at-a-time runner (baseline)
+  records.py         shared per-record rules: retries, rejects, classify, watermarks
+  retry.py           backoff with full jitter, Retry-After, rate-limit gate + hook
   shutdown.py        SIGINT/SIGTERM → drain / cancel
-  replay.py          dead-letter replay
-  pipeline.py        Phase 2 concurrent runner
-  sequential.py      Phase 1 runner (baseline)
+  replay.py          dead-letter replay (per source)
+  storage.py         items upsert, dead letters, ingestion_runs, watermarks
+  httpclient.py      per-source httpx client factory
+  db.py, migrate.py  asyncpg pool; migration runner;  migrations/*.sql  the schema
   toy_pipeline.py    Phase 0 simulation
 benchmarks/          mock HN server (with fault injection), benchmark harness, pool-exhaustion experiment
 tests/               pytest (asyncio auto mode, respx, real Postgres)

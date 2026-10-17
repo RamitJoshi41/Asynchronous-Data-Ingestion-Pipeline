@@ -34,14 +34,16 @@ from pydantic import SecretStr
 
 from ingest.__main__ import migrate_command
 from ingest.config import Settings, get_settings
+from ingest.connectors.hn import HackerNewsConnector
 from ingest.db import create_pool
 from ingest.httpclient import build_http_client
-from ingest.pipeline import ConcurrentRunSummary, PipelineConfig, run_hn_concurrent, settings_for
+from ingest.pipeline import ConcurrentRunSummary, PipelineConfig, run_concurrent
 from ingest.retry import RetryPolicy
-from ingest.sequential import RunSummary, run_hn_sequential
+from ingest.runner import SourcePlan, pool_settings
+from ingest.sequential import RunSummary, run_sequential
 from ingest.storage import Store
 
-PHASE = 3  # the phase that produced new result files
+PHASE = 4  # the phase that produced new result files
 REAL_MAX_ITEMS, REAL_MAX_CONCURRENCY = 30, 10  # politeness caps for the real API
 RESULTS_DIR = Path(__file__).resolve().parent.parent / "docs" / "benchmarks" / "results"
 
@@ -179,25 +181,23 @@ async def one_repeat(
         scoped = settings.model_copy(
             update={"db_dsn": SecretStr(f"{base_dsn}?search_path={schema}")}
         )
-        if cfg is not None:
-            scoped = settings_for(scoped, cfg)  # httpx limits + pool size follow the config
+        connector = HackerNewsConnector(base_url, limit=items)
+        scoped = pool_settings(scoped, [SourcePlan(connector, cfg)])  # pool fits the workers
         await migrate_command(scoped)
         pool = await create_pool(scoped)
         try:
-            async with build_http_client(scoped) as client:
+            # httpx limits follow the measured concurrency (ADR-0019).
+            concurrency = 1 if cfg is None else cfg.concurrency
+            async with build_http_client(scoped, concurrency=concurrency) as client:
                 store = Store(pool, acquire_timeout=scoped.db_acquire_timeout_s)
                 policy = RetryPolicy.from_settings(scoped)
                 cpu_before = time.process_time()
                 try:
                     s: RunSummary
                     if cfg is None:
-                        s = await run_hn_sequential(
-                            store, client, base_url=base_url, limit=items, policy=policy
-                        )
+                        s = await run_sequential(store, client, connector, policy=policy)
                     else:
-                        s = await run_hn_concurrent(
-                            store, client, base_url=base_url, limit=items, cfg=cfg, policy=policy
-                        )
+                        s = await run_concurrent(store, client, connector, cfg=cfg, policy=policy)
                 except Exception as exc:  # a failed run is a data point, not a crash
                     return RepeatResult(0.0, items, 0, 0, 0, True, repr(exc)[:300])
                 cpu = time.process_time() - cpu_before
@@ -228,7 +228,10 @@ async def run_benchmark(args: argparse.Namespace, settings: Settings) -> list[Re
     cfg = None
     if args.mode == "concurrent":
         cfg = PipelineConfig.from_settings(
-            settings, concurrency=args.concurrency, workers=args.workers, batch_size=args.batch_size
+            settings,
+            concurrency=settings.hn_concurrency if args.concurrency is None else args.concurrency,
+            workers=args.workers,
+            batch_size=args.batch_size,
         )
     proc = None
     if args.target == "mock":
@@ -260,7 +263,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="HN ingestion benchmark (sequential/concurrent).")
     parser.add_argument("--target", choices=["mock", "real"], required=True)
     parser.add_argument("--mode", choices=["sequential", "concurrent"], default="sequential")
-    parser.add_argument("--concurrency", type=int, help="concurrent mode (FETCH_CONCURRENCY)")
+    parser.add_argument("--concurrency", type=int, help="concurrent mode (HN_CONCURRENCY)")
     parser.add_argument("--workers", type=int, help="concurrent mode (PIPELINE_WORKERS)")
     parser.add_argument("--batch-size", type=int, help="concurrent mode (BATCH_SIZE)")
     parser.add_argument("--fail-rate", type=float, default=0.0, help="mock: fraction of 500s")
@@ -305,7 +308,10 @@ def main() -> None:
         params["seed"] = args.seed
     if args.mode == "concurrent":
         cfg = PipelineConfig.from_settings(
-            settings, concurrency=args.concurrency, workers=args.workers, batch_size=args.batch_size
+            settings,
+            concurrency=settings.hn_concurrency if args.concurrency is None else args.concurrency,
+            workers=args.workers,
+            batch_size=args.batch_size,
         )
         params |= {"concurrency": cfg.concurrency, "workers": cfg.workers}
         params |= {"batch_size": cfg.batch_size, "flush_interval_s": cfg.flush_interval_s}

@@ -2,10 +2,12 @@ import json
 
 import pytest
 
+from ingest.connectors.hn import HackerNewsConnector
 from ingest.db import DbPool
 from ingest.replay import replay_dead_letters
 from ingest.storage import DeadLetter, RunKind, RunStatus, Store
 
+HN = HackerNewsConnector("https://hn.test/v0", limit=1)  # replay never touches the network
 STORY_9 = {"id": 9, "type": "story", "by": "a", "time": 1175714200, "title": "fixed"}
 
 
@@ -43,7 +45,7 @@ async def test_replay_resolves_now_valid_records_and_keeps_the_rest(
     store: Store, migrated_pool: DbPool
 ) -> None:
     await seed(store)
-    summary = await replay_dead_letters(store, batch_size=2)  # 2 pages of body-level rejects
+    summary = await replay_dead_letters(store, HN, batch_size=2)  # 2 pages of body-level rejects
 
     assert summary.status is RunStatus.SUCCEEDED
     c = summary.counts
@@ -70,13 +72,13 @@ async def test_replay_resolves_now_valid_records_and_keeps_the_rest(
 
 async def test_second_replay_changes_nothing(store: Store, migrated_pool: DbPool) -> None:
     await seed(store)
-    await replay_dead_letters(store)
+    await replay_dead_letters(store, HN)
     items_before = await migrated_pool.fetchval("SELECT count(*) FROM items")
-    again = await replay_dead_letters(store)
+    again = await replay_dead_letters(store, HN)
     assert (again.counts.fetched, again.counts.inserted, again.counts.invalid) == (2, 0, 2)
     assert await migrated_pool.fetchval("SELECT count(*) FROM items") == items_before
 
 
 async def test_replay_with_nothing_open_is_a_successful_no_op(store: Store) -> None:
-    summary = await replay_dead_letters(store)
+    summary = await replay_dead_letters(store, HN)
     assert summary.status is RunStatus.SUCCEEDED and summary.counts.fetched == 0

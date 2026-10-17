@@ -1,0 +1,82 @@
+{
+  "benchmark": "hn_sequential",
+  "phase": 4,
+  "started_at": "2026-10-17T13:43:33.992967+00:00",
+  "machine": {
+    "platform": "Linux-6.8.0-138-generic-x86_64-with-glibc2.35",
+    "python": "3.12.13",
+    "cpu": "11th Gen Intel(R) Core(TM) i5-11400H @ 2.70GHz",
+    "cpu_count": 12
+  },
+  "commit": "95847d9a25744f48a002024692f9faef2768abf4",
+  "dirty": false,
+  "trees": {
+    "src": "78dbf77c9aed1b3fb4b4954fe798cedec59fe378",
+    "benchmarks": "a5d1f217d4d6e04a77a6949778dea984165e0257",
+    "pyproject.toml": "1bedcdf436eadb9d419747be8835ec2ba76b916d",
+    "uv.lock": "5c72c00fe916a584a298903c21c0423f6314d69e"
+  },
+  "params": {
+    "target": "mock",
+    "mode": "sequential",
+    "items": 200,
+    "repeats": 3,
+    "retry_max_attempts": 4,
+    "latency_ms": 50.0,
+    "fail_rate": 0.0,
+    "rate_limit_rate": 0.0,
+    "seed": 0
+  },
+  "repeats": [
+    {
+      "duration_s": 11.479213283000718,
+      "items_requested": 200,
+      "ingested": 200,
+      "invalid": 0,
+      "missing": 0,
+      "failed": false,
+      "error": null,
+      "client_cpu_s": 0.7016791640000001,
+      "peak_in_flight": 1,
+      "blocked_puts": 0,
+      "flushes": 200,
+      "retries": 0,
+      "items_per_s": 17.42279676048663
+    },
+    {
+      "duration_s": 11.30434787500053,
+      "items_requested": 200,
+      "ingested": 200,
+      "invalid": 0,
+      "missing": 0,
+      "failed": false,
+      "error": null,
+      "client_cpu_s": 0.606232576,
+      "peak_in_flight": 1,
+      "blocked_puts": 0,
+      "flushes": 200,
+      "retries": 0,
+      "items_per_s": 17.69230761575361
+    },
+    {
+      "duration_s": 11.23483350099923,
+      "items_requested": 200,
+      "ingested": 200,
+      "invalid": 0,
+      "missing": 0,
+      "failed": false,
+      "error": null,
+      "client_cpu_s": 0.5716546200000001,
+      "peak_in_flight": 1,
+      "blocked_puts": 0,
+      "flushes": 200,
+      "retries": 0,
+      "items_per_s": 17.801776945088857
+    }
+  ],
+  "summary": {
+    "median_duration_s": 11.30434787500053,
+    "median_items_per_s": 17.69230761575361,
+    "error_rate": 0.0
+  }
+}

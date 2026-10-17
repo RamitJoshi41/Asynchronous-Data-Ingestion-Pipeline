@@ -289,3 +289,56 @@ async def test_run_kind_retries_and_cancelled_status_are_recorded(
     await store.finish_run(run_id, RunStatus.CANCELLED, RunCounts(retries=4))
     row = await migrated_pool.fetchrow("SELECT kind, status, retries FROM ingestion_runs")
     assert row is not None and tuple(row) == ("replay", "cancelled", 4)
+
+
+# --- Phase 4: watermarks (ADR-0031) ---------------------------------------------------------
+
+WM1, WM2 = "2026-01-01T00:00:00Z", "2026-02-01T00:00:00Z"
+
+
+async def test_succeeded_run_advances_watermarks_with_its_own_source(
+    store: Store, migrated_pool: DbPool
+) -> None:
+    run_id = await store.start_run("github")
+    await store.finish_run(run_id, RunStatus.SUCCEEDED, RunCounts(), watermarks={"a/b": WM1})
+    assert await store.watermarks("github") == {"a/b": WM1}
+    assert await store.watermarks("hacker_news") == {}
+    row = await migrated_pool.fetchrow("SELECT run_id FROM source_watermarks")
+    assert row is not None and row["run_id"] == run_id
+
+
+async def test_watermarks_only_move_forward(store: Store) -> None:
+    newer = await store.start_run("github")
+    await store.finish_run(newer, RunStatus.SUCCEEDED, RunCounts(), watermarks={"a/b": WM2})
+    older = await store.start_run("github")  # e.g. a slow run that started from an old mark
+    await store.finish_run(older, RunStatus.SUCCEEDED, RunCounts(), watermarks={"a/b": WM1})
+    assert await store.watermarks("github") == {"a/b": WM2}
+
+
+@pytest.mark.parametrize("status", [RunStatus.FAILED, RunStatus.CANCELLED])
+async def test_only_a_succeeded_run_may_advance_watermarks(store: Store, status: RunStatus) -> None:
+    run_id = await store.start_run("github")
+    with pytest.raises(ValueError, match="succeeded"):
+        await store.finish_run(run_id, status, RunCounts(), watermarks={"a/b": WM1})
+    assert await store.watermarks("github") == {}
+
+
+async def test_watermark_and_succeeded_status_commit_together(
+    store: Store, migrated_pool: DbPool
+) -> None:
+    run_id = await store.start_run("github")
+    await store.finish_run(run_id, RunStatus.FAILED, RunCounts())
+    # The run is already finished, so marking it succeeded fails: its watermarks must not land.
+    with pytest.raises(RuntimeError, match="not an unfinished run"):
+        await store.finish_run(run_id, RunStatus.SUCCEEDED, RunCounts(), watermarks={"a/b": WM1})
+    assert await store.watermarks("github") == {}
+
+    # And the other way round: if the watermark write fails, the run is not marked succeeded.
+    run2 = await store.start_run("github")
+    await migrated_pool.execute(
+        "ALTER TABLE source_watermarks ADD CONSTRAINT no_writes CHECK (value = 'never')"
+    )
+    with pytest.raises(asyncpg.CheckViolationError):
+        await store.finish_run(run2, RunStatus.SUCCEEDED, RunCounts(), watermarks={"a/b": WM1})
+    status = await migrated_pool.fetchval("SELECT status FROM ingestion_runs WHERE id = $1", run2)
+    assert status == "running"  # rolled back together; the runner records the failure next

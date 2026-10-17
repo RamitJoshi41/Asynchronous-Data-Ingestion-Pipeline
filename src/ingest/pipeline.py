@@ -1,6 +1,6 @@
-"""Concurrent Hacker News ingestion (Phase 2), made reliable (Phase 3).
+"""Concurrent ingestion (Phase 2), made reliable (Phase 3), generic over a connector (Phase 4).
 
-    feeder ─► id_queue ─► C fetchers ─► raw_queue ─► W workers (validate, per-worker batch) ─► DB
+    feeder ─► job_queue ─► C fetchers ─► raw_queue ─► W workers (validate, per-worker batch) ─► DB
 
 Every queue is bounded (full ⇒ the producer waits: backpressure). All tasks live in TaskGroups, so
 any unexpected error cancels everything and nothing outlives the run. Shutdown is sentinel-driven:
@@ -9,11 +9,14 @@ workers, which flush their last partial batch and exit.
 Phase 3: fetches retry (shared Retrier + rate-limit gate), rejects are dead-lettered in the same
 flush transaction, a stop request drains the pipeline under a deadline, and flushes are
 cancellation-safe so item counts always match committed rows.
-Explainer: docs/explain/ingest/pipeline.md   Decisions: ADR-0014..0027
+Phase 4: what to fetch and how to read it comes from a Connector (ADR-0028); a job may have many
+pages (one fetcher follows them in order), and a succeeded run advances watermarks (ADR-0031).
+Explainer: docs/explain/ingest/pipeline.md   Decisions: ADR-0014..0031
 """
 
 import asyncio
 import time
+from contextlib import aclosing
 from dataclasses import dataclass, field
 from typing import Self
 
@@ -22,17 +25,22 @@ import structlog
 from structlog.typing import FilteringBoundLogger
 
 from ingest.config import Settings
-from ingest.models.hn import SOURCE
-from ingest.records import classify_hn_body, fetch_hn_body, finish_safely, make_retrier
+from ingest.connector import Connector, FetchContext, Job, Record
+from ingest.records import (
+    Fetched,
+    WatermarkTracker,
+    classify,
+    fetch_context,
+    finish_safely,
+    job_pages,
+    make_retrier,
+)
 from ingest.retry import DEFAULT_POLICY, Retrier, RetryPolicy
 from ingest.sequential import RunSummary
 from ingest.shutdown import StopSignal
-from ingest.sources.hn import fetch_top_ids
 from ingest.storage import DeadLetter, RunCounts, RunStatus, Store
 
 log = structlog.get_logger()
-
-type RawEntry = tuple[int, bytes | DeadLetter]  # (requested id, body or an HTTP-level reject)
 
 
 @dataclass(frozen=True)
@@ -41,12 +49,12 @@ class PipelineConfig:
     workers: int
     batch_size: int
     flush_interval_s: float
-    id_queue_maxsize: int
+    job_queue_maxsize: int
     raw_queue_maxsize: int
 
     def __post_init__(self) -> None:
         sizes = (self.concurrency, self.workers, self.batch_size)
-        queues = (self.id_queue_maxsize, self.raw_queue_maxsize)
+        queues = (self.job_queue_maxsize, self.raw_queue_maxsize)
         # Queue maxsize 0 would mean UNBOUNDED in asyncio: forbidden (CLAUDE.md §7).
         if min(*sizes, *queues) < 1 or self.flush_interval_s <= 0:
             raise ValueError(f"invalid pipeline config: {self}")
@@ -56,35 +64,19 @@ class PipelineConfig:
         cls,
         settings: Settings,
         *,
-        concurrency: int | None = None,
+        concurrency: int,
         workers: int | None = None,
         batch_size: int | None = None,
     ) -> Self:
-        """Defaults from Settings; the CLI and benchmark override the three tuning knobs."""
+        """Defaults from Settings. Concurrency is per source (ADR-0030): the caller passes it."""
         return cls(
-            concurrency=settings.fetch_concurrency if concurrency is None else concurrency,
+            concurrency=concurrency,
             workers=settings.pipeline_workers if workers is None else workers,
             batch_size=settings.batch_size if batch_size is None else batch_size,
             flush_interval_s=settings.flush_interval_s,
-            id_queue_maxsize=settings.id_queue_maxsize,
+            job_queue_maxsize=settings.job_queue_maxsize,
             raw_queue_maxsize=settings.raw_queue_maxsize,
         )
-
-
-def settings_for(settings: Settings, cfg: PipelineConfig) -> Settings:
-    """Settings consistent with a (possibly overridden) config, for building the client and pool.
-
-    httpx limits come from `fetch_concurrency` (ADR-0019) and the pool must be >= workers + 1
-    (ADR-0018). If a caller overrides the config but builds resources from the original settings,
-    httpx's pool silently caps concurrency or flushes exhaust the DB pool.
-    """
-    return settings.model_copy(
-        update={
-            "fetch_concurrency": cfg.concurrency,
-            "pipeline_workers": cfg.workers,
-            "db_pool_max_size": max(settings.db_pool_max_size, cfg.workers + 1),
-        }
-    )
 
 
 @dataclass
@@ -97,7 +89,7 @@ class PipelineStats:
     blocked_puts: int = 0
     flushes: int = 0
     flush_sizes: list[int] = field(default_factory=list)
-    skipped_on_stop: int = 0  # ids left unfetched because a stop was requested
+    skipped_on_stop: int = 0  # jobs left unfetched because a stop was requested
 
 
 @dataclass(frozen=True)
@@ -105,21 +97,20 @@ class ConcurrentRunSummary(RunSummary):
     stats: PipelineStats = field(default_factory=PipelineStats)
 
 
-async def run_hn_concurrent(
+async def run_concurrent(
     store: Store,
     client: httpx.AsyncClient,
+    connector: Connector,
     *,
-    base_url: str,
-    limit: int,
     cfg: PipelineConfig,
     policy: RetryPolicy = DEFAULT_POLICY,
     stop: StopSignal | None = None,
     drain_timeout_s: float = 10.0,
 ) -> ConcurrentRunSummary:
-    """Concurrent version of run_hn_sequential: same classification, counts and run lifecycle.
+    """Concurrent version of run_sequential: same classification, counts and run lifecycle.
 
-    Outcomes: `succeeded`; `cancelled` (stop requested and drained, drain deadline exceeded, or
-    forced cancellation); `failed` (an error survived retries; the ExceptionGroup is re-raised).
+    Outcomes: `succeeded` (watermarks advanced); `cancelled` (stop requested and drained, drain
+    deadline exceeded, or forced cancellation); `failed` (an error survived retries; re-raised).
     """
     # Re-checked here because configs can be built in code, bypassing Settings validation.
     if store.pool_max_size < cfg.workers + 1:
@@ -127,15 +118,18 @@ async def run_hn_concurrent(
             f"DB pool max size {store.pool_max_size} < workers + 1 ({cfg.workers + 1}): "
             "flushes would exhaust the pool (ADR-0018)"
         )
-    run_id = await store.start_run(SOURCE)
-    run_log = log.bind(run_id=run_id, source=SOURCE)
-    counts, stats = RunCounts(), PipelineStats()
-    retrier = make_retrier(policy, counts, run_log)
-    stages = _Stages(store, client, base_url, run_id, cfg, counts, stats, run_log, retrier, stop)
+    source = connector.source
+    run_id = await store.start_run(source)
+    run_log = log.bind(run_id=run_id, source=source)
+    counts, stats, tracker = RunCounts(), PipelineStats(), WatermarkTracker()
+    retrier = make_retrier(policy, counts, run_log, connector)
+    ctx = fetch_context(client, retrier, run_log)
+    stages = _Stages(
+        store, connector, ctx, run_id, cfg, counts, stats, run_log, retrier, tracker, stop
+    )
     started = time.perf_counter()
     run_log.info(
         "run_started",
-        limit=limit,
         concurrency=cfg.concurrency,
         workers=cfg.workers,
         batch_size=cfg.batch_size,
@@ -155,11 +149,12 @@ async def run_hn_concurrent(
             drain.reschedule(loop.time() + drain_timeout_s)
 
     try:
-        ids = await retrier.run(lambda: fetch_top_ids(client, base_url, limit=limit))
+        jobs = await connector.plan(ctx, await store.watermarks(source))
+        run_log.info("run_planned", jobs=len(jobs))
         async with asyncio.timeout(None) as drain:
             if stop is not None:
                 stop.on_stop(arm_drain_deadline)
-            await stages.run(ids)
+            await stages.run(jobs)
         finished = True
     except asyncio.CancelledError:
         # Forced shutdown (second signal): let in-progress flushes land, record, re-raise.
@@ -179,8 +174,12 @@ async def run_hn_concurrent(
         await finish_safely(store, run_id, RunStatus.FAILED, counts, repr(exc))
         run_log.error("run_failed", error=repr(exc), **_count_fields(counts))
         raise
-    status = RunStatus.CANCELLED if stop is not None and stop.is_set() else RunStatus.SUCCEEDED
-    await finish_safely(store, run_id, status, counts)
+    if stop is not None and stop.is_set():
+        status = RunStatus.CANCELLED  # not every job ran to the end: watermarks stay put
+        await finish_safely(store, run_id, status, counts)
+    else:
+        status = RunStatus.SUCCEEDED
+        await finish_safely(store, run_id, status, counts, watermarks=tracker.advanced())
     result = summary(status)
     run_log.info(
         "run_finished",
@@ -214,32 +213,33 @@ class _Stages:
     def __init__(
         self,
         store: Store,
-        client: httpx.AsyncClient,
-        base_url: str,
+        connector: Connector,
+        ctx: FetchContext,
         run_id: int,
         cfg: PipelineConfig,
         counts: RunCounts,
         stats: PipelineStats,
         run_log: FilteringBoundLogger,
         retrier: Retrier,
+        tracker: WatermarkTracker,
         stop: StopSignal | None,
     ) -> None:
-        self._store, self._client, self._base_url = store, client, base_url
+        self._store, self._connector, self._ctx = store, connector, ctx
         self._run_id, self._cfg = run_id, cfg
         self._counts, self._stats, self._log = counts, stats, run_log
-        self._retrier, self._stop = retrier, stop
+        self._retrier, self._tracker, self._stop = retrier, tracker, stop
         # None is the sentinel in both queues: "no more work, exit your loop".
-        self._ids: asyncio.Queue[int | None] = asyncio.Queue(cfg.id_queue_maxsize)
-        self._raw: asyncio.Queue[RawEntry | None] = asyncio.Queue(cfg.raw_queue_maxsize)
+        self._jobs: asyncio.Queue[Job | None] = asyncio.Queue(cfg.job_queue_maxsize)
+        self._raw: asyncio.Queue[Fetched | None] = asyncio.Queue(cfg.raw_queue_maxsize)
         # Flush tasks in progress. They outlive a cancelled worker on purpose (see _flush).
         self._inflight: set[asyncio.Task[None]] = set()
 
     def _stopping(self) -> bool:
         return self._stop is not None and self._stop.is_set()
 
-    async def run(self, ids: list[int]) -> None:
+    async def run(self, jobs: list[Job]) -> None:
         async with asyncio.TaskGroup() as tg:
-            tg.create_task(self._feed(ids), name="feeder")
+            tg.create_task(self._feed(jobs), name="feeder")
             tg.create_task(self._fetch_stage(), name="fetch-stage")
             for worker_id in range(self._cfg.workers):
                 tg.create_task(self._worker(worker_id), name=f"worker-{worker_id}")
@@ -249,108 +249,109 @@ class _Stages:
         if self._inflight:
             await asyncio.shield(asyncio.gather(*self._inflight, return_exceptions=True))
 
-    async def _feed(self, ids: list[int]) -> None:
-        for fed, item_id in enumerate(ids):
+    async def _feed(self, jobs: list[Job]) -> None:
+        for fed, job in enumerate(jobs):
             if self._stopping():
-                self._stats.skipped_on_stop = len(ids) - fed
-                self._log.info("feeder_stopped", unfed=len(ids) - fed)
+                self._stats.skipped_on_stop = len(jobs) - fed
+                self._log.info("feeder_stopped", unfed=len(jobs) - fed)
                 break
             # If the queue is full this waits; fetchers keep draining it (even while stopping),
             # so the put always completes and the stop check above runs.
-            await self._ids.put(item_id)
+            await self._jobs.put(job)
         for _ in range(self._cfg.concurrency):
-            await self._ids.put(None)
+            await self._jobs.put(None)
 
     async def _fetch_stage(self) -> None:
         async with asyncio.TaskGroup() as fetchers:
             for fetcher_id in range(self._cfg.concurrency):
                 fetchers.create_task(self._fetcher(), name=f"fetcher-{fetcher_id}")
-        # Every fetched body is now in raw_queue; FIFO puts the sentinels behind all of them.
+        # Every fetched page is now in raw_queue; FIFO puts the sentinels behind all of them.
         for _ in range(self._cfg.workers):
             await self._raw.put(None)
 
     async def _fetcher(self) -> None:
         while True:
-            item_id = await self._ids.get()
-            if item_id is None:
+            job = await self._jobs.get()
+            if job is None:
                 return
             if self._stopping():
-                self._stats.skipped_on_stop += 1  # drain: take ids off the queue, don't fetch
+                self._stats.skipped_on_stop += 1  # drain: take jobs off the queue, don't fetch
                 continue
-            self._stats.in_flight += 1
-            self._stats.peak_in_flight = max(self._stats.peak_in_flight, self._stats.in_flight)
-            try:
-                fetched = await fetch_hn_body(
-                    self._client, self._base_url, item_id, self._retrier, self._log
-                )
-            finally:
-                self._stats.in_flight -= 1
-            self._counts.fetched += 1
-            await self._put_raw((item_id, fetched))
+            await self._fetch_job(job)
 
-    async def _put_raw(self, entry: RawEntry) -> None:
+    async def _fetch_job(self, job: Job) -> None:
+        """Fetch one job's pages in order. Only this fetcher touches the job (ADR-0028)."""
+        pages = job_pages(self._connector, self._ctx, job, self._retrier, self._tracker)
+        async with aclosing(pages):
+            while True:
+                self._stats.in_flight += 1
+                self._stats.peak_in_flight = max(self._stats.peak_in_flight, self._stats.in_flight)
+                try:
+                    fetched = await anext(pages, None)
+                finally:
+                    self._stats.in_flight -= 1
+                if fetched is None:
+                    return
+                await self._put_raw(fetched)
+                if self._stopping():
+                    return  # drain: the page in hand is queued; don't start the next one
+
+    async def _put_raw(self, entry: Fetched) -> None:
         if not self._raw.full():
             await self._raw.put(entry)  # does not suspend when there is room
         else:
+            key = entry.job.key if not isinstance(entry, DeadLetter) else entry.source_id
             self._stats.blocked_puts += 1
-            self._log.info("producer_blocked", item_id=entry[0], queue_depth=self._raw.qsize())
+            self._log.info("producer_blocked", job=key, queue_depth=self._raw.qsize())
             waited_from = time.monotonic()
             await self._raw.put(entry)
             waited_ms = round((time.monotonic() - waited_from) * 1000, 1)
-            self._log.info("producer_unblocked", item_id=entry[0], waited_ms=waited_ms)
+            self._log.info("producer_unblocked", job=key, waited_ms=waited_ms)
         self._stats.peak_raw_queue_depth = max(self._stats.peak_raw_queue_depth, self._raw.qsize())
 
     async def _worker(self, worker_id: int) -> None:
         loop = asyncio.get_running_loop()
-        items: list[tuple[str, str]] = []
-        rejects: list[DeadLetter] = []
+        buffer: list[Record | DeadLetter] = []
         deadline = 0.0  # loop time by which the oldest buffered record must be flushed
         while True:
-            pending = len(items) + len(rejects)
             # get() on a non-empty queue returns without suspending, so the timeout below can't
             # fire under sustained load: honour the deadline explicitly as well.
-            if pending and loop.time() >= deadline:
-                await self._flush(worker_id, items, rejects, reason="interval")
-                items, rejects = [], []
+            if buffer and loop.time() >= deadline:
+                await self._flush(worker_id, buffer, reason="interval")
+                buffer = []
                 continue
             try:
                 # No timeout while the buffer is empty; otherwise wake up at the flush deadline.
                 # Cancelling a waiting get() never loses an item (CPython queues.py).
-                async with asyncio.timeout_at(deadline if pending else None):
+                async with asyncio.timeout_at(deadline if buffer else None):
                     entry = await self._raw.get()
             except TimeoutError:
-                await self._flush(worker_id, items, rejects, reason="interval")
-                items, rejects = [], []
+                await self._flush(worker_id, buffer, reason="interval")
+                buffer = []
                 continue
             if entry is None:
-                if pending:
-                    await self._flush(worker_id, items, rejects, reason="final")
+                if buffer:
+                    await self._flush(worker_id, buffer, reason="final")
                 return
-            result = classify_hn_body(entry[1], entry[0], self._counts, self._log)
-            if result is None:
-                continue
-            if not pending:
+            results = classify(self._connector, entry, self._counts, self._log, self._tracker)
+            if results and not buffer:
                 deadline = loop.time() + self._cfg.flush_interval_s
-            if isinstance(result, DeadLetter):
-                rejects.append(result)
-            else:
-                items.append((str(result.id), result.model_dump_json()))
-            if len(items) + len(rejects) >= self._cfg.batch_size:
-                await self._flush(worker_id, items, rejects, reason="size")
-                items, rejects = [], []
+            buffer.extend(results)
+            # One page can hold many records (GitHub: 100), so write exact-size chunks.
+            size = self._cfg.batch_size
+            while len(buffer) >= size:
+                await self._flush(worker_id, buffer[:size], reason="size")
+                buffer = buffer[size:]
+                if buffer:
+                    deadline = loop.time() + self._cfg.flush_interval_s
 
     async def _flush(
-        self,
-        worker_id: int,
-        items: list[tuple[str, str]],
-        rejects: list[DeadLetter],
-        *,
-        reason: str,
+        self, worker_id: int, batch: list[Record | DeadLetter], *, reason: str
     ) -> None:
         # Cancellation-safe (ADR-0027): the write AND the counting run as one task that a
         # cancelled worker can't interrupt halfway; settle() awaits it before the run is recorded.
         write = asyncio.create_task(
-            self._write(worker_id, items, rejects, reason), name=f"flush-w{worker_id}"
+            self._write(worker_id, batch, reason), name=f"flush-w{worker_id}"
         )
         self._inflight.add(write)
         write.add_done_callback(self._write_done)
@@ -363,21 +364,21 @@ class _Stages:
         if not task.cancelled() and (exc := task.exception()) is not None:
             self._log.warning("flush_failed", task=task.get_name(), error=repr(exc))
 
-    async def _write(
-        self, worker_id: int, items: list[tuple[str, str]], rejects: list[DeadLetter], reason: str
-    ) -> None:
-        result = await self._store.flush(self._run_id, SOURCE, items, rejects)
+    async def _write(self, worker_id: int, batch: list[Record | DeadLetter], reason: str) -> None:
+        items = [(r.source_id, r.payload_json) for r in batch if isinstance(r, Record)]
+        rejects = [r for r in batch if isinstance(r, DeadLetter)]
+        result = await self._store.flush(self._run_id, self._connector.source, items, rejects)
         for outcome in result.outcomes.values():
             self._counts.record(outcome)
         if len(result.outcomes) < len(items):
             dropped = len(items) - len(result.outcomes)
             self._log.warning("batch_duplicates", worker_id=worker_id, dropped=dropped)
         self._stats.flushes += 1
-        self._stats.flush_sizes.append(len(items) + len(rejects))
+        self._stats.flush_sizes.append(len(batch))
         self._log.debug(
             "batch_flushed",
             worker_id=worker_id,
-            size=len(items) + len(rejects),
+            size=len(batch),
             dead_lettered=result.dead_lettered,
             resolved=result.resolved,
             reason=reason,

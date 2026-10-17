@@ -34,6 +34,7 @@ def test_loads_real_migrations_in_version_order() -> None:
         (2, "items"),
         (3, "run_reliability"),
         (4, "dead_letter"),
+        (5, "watermarks"),
     ]
     assert all(len(m.checksum) == 64 for m in migrations)
 
@@ -53,7 +54,7 @@ def test_rejects_duplicate_versions(tmp_path: Path) -> None:
 
 async def test_applies_real_migrations_once(pool: DbPool) -> None:
     migrations = load_migrations()
-    assert await apply_migrations(pool, migrations, acquire_timeout=T) == [1, 2, 3, 4]
+    assert await apply_migrations(pool, migrations, acquire_timeout=T) == [1, 2, 3, 4, 5]
     assert {"ingestion_runs", "items", "dead_letter", "schema_migrations"} <= await table_names(
         pool
     )

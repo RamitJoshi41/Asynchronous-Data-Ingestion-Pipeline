@@ -11,6 +11,7 @@ from ingest.retry import (
     Retrier,
     RetryAfterTooLongError,
     RetryPolicy,
+    default_rate_limit,
     is_retryable,
     retry_after_seconds,
 )
@@ -219,3 +220,54 @@ def test_gate_never_shortens_an_existing_pause() -> None:
     gate.pause_for(10)
     gate.pause_for(2)
     assert gate.remaining() == 10
+
+
+# --- Phase 4: per-connector rate-limit hook (ADR-0032) ------------------------------------------
+
+
+def github_like(response: httpx.Response) -> float | None:
+    """A connector hook: 403 + an exhausted quota header is a rate limit; a plain 403 is not."""
+    if response.status_code == 403 and response.headers.get("x-ratelimit-remaining") == "0":
+        return 4.0
+    return None
+
+
+def forbidden(remaining: str | None) -> httpx.HTTPStatusError:
+    request = httpx.Request("GET", "https://api.test/x")
+    headers = {"x-ratelimit-remaining": remaining} if remaining is not None else {}
+    response = httpx.Response(403, headers=headers, request=request)
+    return httpx.HTTPStatusError("403", request=request, response=response)
+
+
+async def test_hook_makes_a_403_rate_limit_retryable_and_pauses_everyone() -> None:
+    t = FakeTime()
+    gate = RateLimitGate(clock=t.clock)
+    retrier = Retrier(POLICY, gate=gate, rate_limit=github_like, sleep=t.sleep)
+    calls, call = flaky([forbidden(remaining="0")])
+    assert retrier.is_retryable(forbidden(remaining="0"))
+    assert await retrier.run(call) == "ok"
+    assert t.sleeps == [4.0] and len(calls) == 2
+
+
+async def test_hook_leaves_a_plain_403_non_retryable() -> None:
+    t = FakeTime()
+    retrier = Retrier(POLICY, rate_limit=github_like, sleep=t.sleep)
+    calls, call = flaky([forbidden(remaining=None)])
+    with pytest.raises(httpx.HTTPStatusError):
+        await retrier.run(call)
+    assert len(calls) == 1 and t.sleeps == []
+
+
+async def test_hook_delay_over_the_cap_gives_up() -> None:
+    t = FakeTime()
+    retrier = Retrier(POLICY, rate_limit=lambda r: 3600.0, sleep=t.sleep)
+    _, call = flaky([forbidden(remaining="0")])
+    with pytest.raises(RetryAfterTooLongError, match="3600s"):
+        await retrier.run(call)
+    assert t.sleeps == []
+
+
+def test_default_hook_is_429_with_retry_after_only() -> None:
+    assert default_rate_limit(httpx.Response(429, headers={"Retry-After": "2"})) == 2.0
+    assert default_rate_limit(httpx.Response(429)) is None  # retried, but with jitter
+    assert default_rate_limit(httpx.Response(503, headers={"Retry-After": "2"})) is None

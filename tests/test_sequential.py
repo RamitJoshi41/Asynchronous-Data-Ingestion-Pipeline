@@ -7,23 +7,30 @@ import respx
 from structlog.testing import capture_logs
 
 from ingest.config import Settings
+from ingest.connectors.hn import HackerNewsConnector
 from ingest.db import DbPool
 from ingest.httpclient import build_http_client
 from ingest.retry import RetryPolicy
-from ingest.sequential import run_hn_sequential
+from ingest.sequential import run_sequential
 from ingest.shutdown import StopSignal
 from ingest.storage import RunStatus, Store
 
 FAST = RetryPolicy(max_attempts=3, base_delay_s=0.001, max_delay_s=0.005, max_retry_after_s=5)
 
 BASE = "https://hn.test/v0"
+
+
+def hn(limit: int) -> HackerNewsConnector:
+    return HackerNewsConnector(BASE, limit=limit)
+
+
 STORY = {"id": 1, "type": "story", "by": "a", "time": 1175714200, "title": "t", "score": 5}
 JOB = {"id": 4, "type": "job", "by": "b", "time": 1210981217, "title": "j"}
 
 
 @pytest.fixture
 async def client() -> AsyncIterator[httpx.AsyncClient]:
-    async with build_http_client(Settings(_env_file=None)) as c:
+    async with build_http_client(Settings(_env_file=None), concurrency=10) as c:
         yield c
 
 
@@ -61,7 +68,7 @@ async def test_mixed_items_are_classified_and_valid_ones_stored(
     migrated_pool: DbPool,
 ) -> None:
     mock_items(respx_mock, MIXED)
-    summary = await run_hn_sequential(store, client, base_url=BASE, limit=5)
+    summary = await run_sequential(store, client, hn(5))
 
     c = summary.counts
     assert summary.status is RunStatus.SUCCEEDED
@@ -85,8 +92,8 @@ async def test_rerun_reports_unchanged_and_writes_nothing_new(
     store: Store, client: httpx.AsyncClient, respx_mock: respx.MockRouter
 ) -> None:
     mock_items(respx_mock, {1: STORY, 4: JOB})
-    await run_hn_sequential(store, client, base_url=BASE, limit=2)
-    second = await run_hn_sequential(store, client, base_url=BASE, limit=2)
+    await run_sequential(store, client, hn(2))
+    second = await run_sequential(store, client, hn(2))
     assert (second.counts.inserted, second.counts.unchanged) == (0, 2)
 
 
@@ -94,7 +101,7 @@ async def test_limit_fetches_only_the_first_n_items(
     store: Store, client: httpx.AsyncClient, respx_mock: respx.MockRouter
 ) -> None:
     mock_items(respx_mock, {1: STORY, 4: JOB, 7: {**STORY, "id": 7}})
-    summary = await run_hn_sequential(store, client, base_url=BASE, limit=2)
+    summary = await run_sequential(store, client, hn(2))
     assert summary.counts.fetched == 2
     assert not respx_mock.routes[3].called  # item 7 was never requested
 
@@ -111,7 +118,7 @@ async def test_http_error_mid_run_marks_run_failed_and_reraises(
     respx_mock.get(f"{BASE}/item/8.json").respond(status_code=500)
 
     with pytest.raises(httpx.HTTPStatusError):
-        await run_hn_sequential(store, client, base_url=BASE, limit=3, policy=FAST)
+        await run_sequential(store, client, hn(3), policy=FAST)
 
     row = await migrated_pool.fetchrow("SELECT * FROM ingestion_runs ORDER BY id DESC LIMIT 1")
     assert row is not None
@@ -130,7 +137,7 @@ async def test_network_failure_on_top_ids_marks_run_failed(
 ) -> None:
     respx_mock.get(f"{BASE}/topstories.json").mock(side_effect=httpx.ConnectError("down"))
     with pytest.raises(httpx.ConnectError):
-        await run_hn_sequential(store, client, base_url=BASE, limit=3, policy=FAST)
+        await run_sequential(store, client, hn(3), policy=FAST)
     row = await migrated_pool.fetchrow(
         "SELECT status, items_fetched FROM ingestion_runs ORDER BY id DESC LIMIT 1"
     )
@@ -143,15 +150,19 @@ async def test_logs_carry_run_context_but_never_payloads(
 ) -> None:
     mock_items(respx_mock, MIXED)
     with capture_logs() as logs:
-        summary = await run_hn_sequential(store, client, base_url=BASE, limit=5)
+        summary = await run_sequential(store, client, hn(5))
 
-    invalid = [e for e in logs if e["event"] == "item_invalid"]
-    assert [e["item_id"] for e in invalid] == [2]
+    invalid = [e for e in logs if e["event"] == "record_invalid"]
+    assert [(e["source_id"], e["reason"]) for e in invalid] == [
+        ("2", "invalid"),
+        ("5", "id_mismatch"),
+    ]
     assert invalid[0]["problems"] == ["score:int_type"]
     assert all(e["run_id"] == summary.run_id and e["source"] == "hacker_news" for e in logs)
     assert "lots" not in repr(logs)  # the offending raw value is not logged
     assert [e["event"] for e in logs if e["event"].startswith("run_")] == [
         "run_started",
+        "run_planned",
         "run_finished",
     ]
 
@@ -163,7 +174,7 @@ async def test_rejects_are_dead_lettered(
     store: Store, client: httpx.AsyncClient, respx_mock: respx.MockRouter, migrated_pool: DbPool
 ) -> None:
     mock_items(respx_mock, MIXED)
-    await run_hn_sequential(store, client, base_url=BASE, limit=5, policy=FAST)
+    await run_sequential(store, client, hn(5), policy=FAST)
     rows = await migrated_pool.fetch("SELECT source_id, reason FROM dead_letter ORDER BY 1")
     assert [(r["source_id"], r["reason"]) for r in rows] == [("2", "invalid"), ("5", "id_mismatch")]
 
@@ -175,7 +186,7 @@ async def test_transient_error_is_retried(
     respx_mock.get(f"{BASE}/item/1.json").mock(
         side_effect=[httpx.ConnectError("drop"), httpx.Response(200, json=STORY)]
     )
-    summary = await run_hn_sequential(store, client, base_url=BASE, limit=1, policy=FAST)
+    summary = await run_sequential(store, client, hn(1), policy=FAST)
     assert (summary.counts.inserted, summary.counts.retries) == (1, 1)
 
 
@@ -190,7 +201,7 @@ async def test_stop_ends_run_after_current_item_as_cancelled(
         return httpx.Response(200, json=STORY)
 
     respx_mock.get(f"{BASE}/item/1.json").mock(side_effect=first_then_stop)
-    summary = await run_hn_sequential(store, client, base_url=BASE, limit=3, stop=stop)
+    summary = await run_sequential(store, client, hn(3), stop=stop)
     assert summary.status is RunStatus.CANCELLED
     assert summary.counts.fetched == 1  # item 1 finished; 4 and 7 never requested
     row = await migrated_pool.fetchrow("SELECT status, items_inserted FROM ingestion_runs")

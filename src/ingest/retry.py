@@ -1,7 +1,8 @@
 """Hand-rolled retries: classification, full-jitter backoff, Retry-After, and a shared gate.
 
-Source-agnostic. `sleep`, `rng` and `now` are injectable so tests are instant and deterministic.
-Explainer: docs/explain/ingest/retry.md   Decisions: ADR-0021, ADR-0022, ADR-0023
+Source-agnostic: what counts as a rate limit for a particular API is a hook the connector supplies
+(ADR-0032). `sleep`, `rng` and `now` are injectable so tests are instant and deterministic.
+Explainer: docs/explain/ingest/retry.md   Decisions: ADR-0021, ADR-0022, ADR-0023, ADR-0032
 """
 
 import asyncio
@@ -59,6 +60,9 @@ def is_retryable(exc: BaseException) -> bool:
     return isinstance(exc, _RETRYABLE_TRANSPORT)
 
 
+type RateLimitHint = Callable[[httpx.Response], float | None]
+
+
 def retry_after_seconds(value: str | None, *, now: datetime | None = None) -> float | None:
     """Parse Retry-After: delta-seconds ("120") or an HTTP-date. None if absent or unparseable."""
     if value is None:
@@ -73,6 +77,13 @@ def retry_after_seconds(value: str | None, *, now: datetime | None = None) -> fl
     if when.tzinfo is None:  # RFC 9110 dates are GMT; be lenient with naive ones
         when = when.replace(tzinfo=UTC)
     return max(0.0, (when - (now or datetime.now(UTC))).total_seconds())
+
+
+def default_rate_limit(response: httpx.Response) -> float | None:
+    """The HTTP-standard signal: 429 with Retry-After. Seconds to pause everyone, or None."""
+    if response.status_code != 429:
+        return None
+    return retry_after_seconds(response.headers.get("Retry-After"))
 
 
 class RateLimitGate:
@@ -93,38 +104,52 @@ type OnRetry = Callable[[int, float, BaseException], None]
 
 
 class Retrier:
-    """Runs a call with retries. One instance per run, shared by all fetchers of that run."""
+    """Runs a call with retries. One instance per run, shared by all fetchers of that run.
+
+    `rate_limit` maps a failed response to "pause everyone for N seconds" (or None). A response it
+    recognises is retryable even if its status isn't in RETRYABLE_STATUSES, e.g. GitHub's 403 with
+    `x-ratelimit-remaining: 0` (ADR-0032).
+    """
 
     def __init__(
         self,
         policy: RetryPolicy,
         *,
         gate: RateLimitGate | None = None,
+        rate_limit: RateLimitHint = default_rate_limit,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         rng: Callable[[], float] = random.random,
         on_retry: OnRetry | None = None,
     ) -> None:
         self.policy = policy
         self.gate = gate or RateLimitGate()
+        self._rate_limit = rate_limit
         self._sleep, self._rng, self._on_retry = sleep, rng, on_retry
 
-    @staticmethod
-    def is_retryable(exc: BaseException) -> bool:
+    def is_retryable(self, exc: BaseException) -> bool:
+        if isinstance(exc, httpx.HTTPStatusError) and self._rate_limit(exc.response) is not None:
+            return True
         return is_retryable(exc)
 
+    def _capped(self, seconds: float, exc: BaseException) -> float:
+        if seconds > self.policy.max_retry_after_s:
+            limit = self.policy.max_retry_after_s
+            raise RetryAfterTooLongError(
+                f"server asked to wait {seconds:.0f}s (> {limit:.0f}s)"
+            ) from exc
+        return seconds
+
     def delay_for(self, retry_number: int, exc: BaseException) -> float:
-        """Retry-After (if the server sent one) beats our guess; otherwise full jitter."""
+        """A server instruction beats our guess; otherwise full jitter."""
         if isinstance(exc, httpx.HTTPStatusError):
+            limited = self._rate_limit(exc.response)
+            if limited is not None:
+                # A rate limit is about the server, not this request: everyone holds off.
+                self.gate.pause_for(self._capped(limited, exc))
+                return limited
             server_says = retry_after_seconds(exc.response.headers.get("Retry-After"))
-            if server_says is not None:
-                if server_says > self.policy.max_retry_after_s:
-                    limit = self.policy.max_retry_after_s
-                    raise RetryAfterTooLongError(
-                        f"Retry-After {server_says:.0f}s exceeds {limit:.0f}s"
-                    ) from exc
-                if exc.response.status_code == 429:
-                    self.gate.pause_for(server_says)
-                return server_says
+            if server_says is not None:  # e.g. 503 + Retry-After: this request only
+                return self._capped(server_says, exc)
         # Full jitter: uniform in [0, cap). Spreads retries out so clients don't stampede together.
         return self._rng() * self.policy.backoff_cap(retry_number)
 
@@ -137,7 +162,7 @@ class Retrier:
             try:
                 return await call()
             except Exception as exc:
-                if not is_retryable(exc) or attempt >= self.policy.max_attempts:
+                if not self.is_retryable(exc) or attempt >= self.policy.max_attempts:
                     raise
                 delay = self.delay_for(attempt, exc)
                 if self._on_retry is not None:

@@ -1,4 +1,4 @@
-"""Postgres writes: the generic `items` upsert, dead letters, and `ingestion_runs` bookkeeping.
+"""Postgres writes: the generic `items` upsert, dead letters, `ingestion_runs`, and watermarks.
 
 Source-agnostic on purpose (ADR-0006): it stores `(source, source_id, payload_json)` and never
 imports a source model. Every connection is acquired with an explicit timeout (asyncpg's
@@ -6,7 +6,7 @@ imports a source model. Every connection is acquired with an explicit timeout (a
 """
 
 import json
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
 
@@ -74,6 +74,21 @@ WHERE id = $1 AND status = 'running'
 """
 
 
+# Watermarks only move forward (ADR-0031): a slow, older run finishing late can't rewind them.
+# The source comes from the run row itself, so a run can only write its own source's marks.
+_ADVANCE_WATERMARKS = """
+INSERT INTO source_watermarks (source, key, value, run_id)
+SELECT r.source, w.key, w.value, r.id
+FROM ingestion_runs AS r, unnest($2::text[], $3::text[]) AS w (key, value)
+WHERE r.id = $1
+ON CONFLICT (source, key) DO UPDATE
+    SET value = EXCLUDED.value, run_id = EXCLUDED.run_id, updated_at = now()
+    WHERE source_watermarks.value < EXCLUDED.value
+"""
+
+_WATERMARKS = "SELECT key, value FROM source_watermarks WHERE source = $1"
+
+
 class UpsertOutcome(StrEnum):
     INSERTED = "inserted"
     UPDATED = "updated"
@@ -97,7 +112,7 @@ class DeadLetter:
     """A record that could not be ingested, with everything needed to inspect or replay it."""
 
     source_id: str
-    reason: str  # invalid | id_mismatch | http_<status>
+    reason: str  # invalid | id_mismatch | invalid_page | http_<status>
     errors: list[str] = field(default_factory=list)  # "loc:type" strings, never raw values
     raw_body: bytes = b""
 
@@ -154,11 +169,23 @@ class Store:
         return run_id
 
     async def finish_run(
-        self, run_id: int, status: RunStatus, counts: RunCounts, error: str | None = None
+        self,
+        run_id: int,
+        status: RunStatus,
+        counts: RunCounts,
+        error: str | None = None,
+        *,
+        watermarks: Mapping[str, str] | None = None,
     ) -> None:
+        """Finalise the run; a succeeded run also advances its watermarks, atomically (ADR-0031)."""
         if status is RunStatus.RUNNING:
             raise ValueError("finish_run needs a terminal status")
-        async with self._pool.acquire(timeout=self._acquire_timeout) as conn:
+        if watermarks and status is not RunStatus.SUCCEEDED:
+            raise ValueError("only a succeeded run may advance watermarks")
+        async with (
+            self._pool.acquire(timeout=self._acquire_timeout) as conn,
+            conn.transaction(),
+        ):
             result = await conn.execute(
                 _FINISH_RUN,
                 run_id,
@@ -172,9 +199,19 @@ class Store:
                 counts.retries,
                 None if error is None else error[:MAX_ERROR_CHARS],
             )
-        # "UPDATE 0" means the run doesn't exist or was already finished: a logic bug upstream.
-        if result != "UPDATE 1":
-            raise RuntimeError(f"run {run_id} is not an unfinished run ({result})")
+            # "UPDATE 0": the run doesn't exist or was already finished, a logic bug upstream.
+            # Raising inside the transaction also rolls back (and so skips) the watermarks.
+            if result != "UPDATE 1":
+                raise RuntimeError(f"run {run_id} is not an unfinished run ({result})")
+            if watermarks:
+                await conn.execute(
+                    _ADVANCE_WATERMARKS, run_id, list(watermarks), list(watermarks.values())
+                )
+
+    async def watermarks(self, source: str) -> dict[str, str]:
+        async with self._pool.acquire(timeout=self._acquire_timeout) as conn:
+            rows = await conn.fetch(_WATERMARKS, source)
+        return {r["key"]: r["value"] for r in rows}
 
     async def upsert_items(
         self, run_id: int, source: str, records: Sequence[tuple[str, str]]

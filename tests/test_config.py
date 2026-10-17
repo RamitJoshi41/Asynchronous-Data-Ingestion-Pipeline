@@ -63,12 +63,15 @@ def test_default_dsn_targets_compose_db_port() -> None:
         ("DB_POOL_MAX_SIZE", "0"),
         ("HTTP_READ_TIMEOUT_S", "0"),
         ("DB_COMMAND_TIMEOUT_S", "-1"),
-        ("FETCH_CONCURRENCY", "0"),
-        ("FETCH_CONCURRENCY", "201"),
+        ("HN_CONCURRENCY", "0"),
+        ("HN_CONCURRENCY", "201"),
+        ("GITHUB_CONCURRENCY", "0"),
+        ("GITHUB_MAX_PAGES", "0"),
+        ("GITHUB_REPOS", "[]"),
         ("BATCH_SIZE", "0"),
         ("FLUSH_INTERVAL_S", "0"),
         ("RAW_QUEUE_MAXSIZE", "0"),  # asyncio would treat 0 as unbounded
-        ("ID_QUEUE_MAXSIZE", "0"),
+        ("JOB_QUEUE_MAXSIZE", "0"),
         ("RETRY_MAX_ATTEMPTS", "0"),
         ("RETRY_MAX_ATTEMPTS", "11"),
         ("RETRY_BASE_DELAY_S", "0"),
@@ -107,4 +110,16 @@ def test_retry_base_delay_cannot_exceed_max(monkeypatch: pytest.MonkeyPatch) -> 
     monkeypatch.setenv("RETRY_BASE_DELAY_S", "20")
     monkeypatch.setenv("RETRY_MAX_DELAY_S", "10")
     with pytest.raises(ValidationError, match="retry_base_delay_s"):
+        Settings(_env_file=None)
+
+
+def test_github_repos_come_from_a_json_list(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("GITHUB_REPOS", '["python/cpython", "encode/httpx"]')
+    assert Settings(_env_file=None).github_repos == ["python/cpython", "encode/httpx"]
+
+
+@pytest.mark.parametrize("bad", ['["cpython"]', '["a/b/c"]', '["/x"]'])
+def test_github_repos_must_be_owner_slash_repo(monkeypatch: pytest.MonkeyPatch, bad: str) -> None:
+    monkeypatch.setenv("GITHUB_REPOS", bad)
+    with pytest.raises(ValidationError, match="owner/repo"):
         Settings(_env_file=None)
