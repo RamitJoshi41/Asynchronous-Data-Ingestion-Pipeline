@@ -34,12 +34,14 @@ packages = ["src/ingest"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+# Repo root on sys.path so tests can import the top-level `benchmarks` tooling package (ADR-0012).
+pythonpath = ["."]
 asyncio_default_fixture_loop_scope = "function"
 
 [tool.mypy]
 strict = true
 python_version = "3.12"
-files = ["src", "tests"]
+files = ["src", "tests", "benchmarks"]
 mypy_path = "src"
 # Teaches mypy pydantic's real __init__ signatures, e.g. BaseSettings(_env_file=...).
 plugins = ["pydantic.mypy"]
