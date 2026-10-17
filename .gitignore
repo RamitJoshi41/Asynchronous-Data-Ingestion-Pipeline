@@ -9,3 +9,9 @@ build/
 .ruff_cache/
 .pytest_cache/
 .env
+
+# Design notes stay local, not published (RJ's decision, 2026-10-17). Benchmark results are published.
+CLAUDE.md
+docs/*
+!docs/BENCHMARKS.md
+!docs/benchmarks/

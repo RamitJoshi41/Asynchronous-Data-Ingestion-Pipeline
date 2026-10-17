@@ -1,8 +1,17 @@
 # Benchmarks
 
 Only numbers produced by `benchmarks/run.py` appear here. Each one links to its raw JSON in
-`docs/benchmarks/results/`. Harness design: [ADR-0012](adr/0012-benchmark-harness.md), explainer:
-[explain/benchmarks/run.md](explain/benchmarks/run.md).
+`docs/benchmarks/results/`. Harness: `benchmarks/run.py`, `benchmarks/mock_hn.py`,
+`benchmarks/pool_exhaustion.py`.
+
+**Commit provenance.** Each JSON records the commit it was measured at. Local history was later
+rewritten (2026-10-17) to keep design notes out of the published repo. Code was unchanged, so the
+recorded hashes map to these published commits:
+
+| Hash in JSON | Published commit | Contents |
+|---|---|---|
+| `ef7bab9` | `d02f9c4` | benchmark harness skeleton (Phase 1 results) |
+| `97f0bc9` | `ad43183` | concurrent mode + pool experiment (Phase 2 results) |
 
 ## Methodology
 
@@ -88,7 +97,9 @@ the raw queue (`blocked_puts = 0`), so the workers and DB kept up at all three l
 | Phase 2 concurrent C = 5 (11:19 UTC) | 30 | 3.931 s | 7.63 items/s | 0.0 | [json](benchmarks/results/2026-10-17T11-19-50Z_hn_concurrent_c5_real.json) |
 
 About 3.2× faster. **Caveat:** two single runs about 3 hours apart over a home network, so network
-conditions differed. Indicative only, not a controlled comparison.
+conditions differed. Indicative only, not a controlled comparison. A supporting observation, not a
+benchmark file: a CLI `run hn --limit 30 --sequential` about 4 minutes after the concurrent run logged
+`duration_s=12.773` (the same timer as the harness), consistent with the morning baseline.
 
 **Pool-exhaustion experiment** (`benchmarks/pool_exhaustion.py`, 4 simulated flushes each holding a
 connection for 0.2 s via `pg_sleep`, [json](benchmarks/results/2026-10-17T11-19-55Z_pool_exhaustion.json)):
