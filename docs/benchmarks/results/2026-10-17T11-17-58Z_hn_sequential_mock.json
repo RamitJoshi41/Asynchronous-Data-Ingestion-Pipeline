@@ -1,0 +1,69 @@
+{
+  "benchmark": "hn_sequential",
+  "phase": 2,
+  "started_at": "2026-10-17T11:17:58.438806+00:00",
+  "machine": {
+    "platform": "Linux-6.8.0-138-generic-x86_64-with-glibc2.35",
+    "python": "3.12.13",
+    "cpu": "11th Gen Intel(R) Core(TM) i5-11400H @ 2.70GHz",
+    "cpu_count": 12
+  },
+  "commit": "97f0bc9f55a4c5cd1bf018ea308167fe56ea6ca1",
+  "dirty": false,
+  "params": {
+    "target": "mock",
+    "mode": "sequential",
+    "items": 200,
+    "repeats": 3,
+    "latency_ms": 50.0
+  },
+  "repeats": [
+    {
+      "duration_s": 11.57654103599998,
+      "items_requested": 200,
+      "ingested": 200,
+      "invalid": 0,
+      "missing": 0,
+      "failed": false,
+      "error": null,
+      "client_cpu_s": 0.789780675,
+      "peak_in_flight": 1,
+      "blocked_puts": 0,
+      "flushes": 200,
+      "items_per_s": 17.276317630460852
+    },
+    {
+      "duration_s": 11.563752290001503,
+      "items_requested": 200,
+      "ingested": 200,
+      "invalid": 0,
+      "missing": 0,
+      "failed": false,
+      "error": null,
+      "client_cpu_s": 0.7905699620000002,
+      "peak_in_flight": 1,
+      "blocked_puts": 0,
+      "flushes": 200,
+      "items_per_s": 17.29542409628821
+    },
+    {
+      "duration_s": 11.641319349999321,
+      "items_requested": 200,
+      "ingested": 200,
+      "invalid": 0,
+      "missing": 0,
+      "failed": false,
+      "error": null,
+      "client_cpu_s": 0.8341658569999999,
+      "peak_in_flight": 1,
+      "blocked_puts": 0,
+      "flushes": 200,
+      "items_per_s": 17.180183275361454
+    }
+  ],
+  "summary": {
+    "median_duration_s": 11.57654103599998,
+    "median_items_per_s": 17.276317630460852,
+    "error_rate": 0.0
+  }
+}

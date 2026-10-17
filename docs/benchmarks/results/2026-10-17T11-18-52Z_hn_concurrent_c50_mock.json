@@ -1,0 +1,74 @@
+{
+  "benchmark": "hn_concurrent",
+  "phase": 2,
+  "started_at": "2026-10-17T11:18:52.312625+00:00",
+  "machine": {
+    "platform": "Linux-6.8.0-138-generic-x86_64-with-glibc2.35",
+    "python": "3.12.13",
+    "cpu": "11th Gen Intel(R) Core(TM) i5-11400H @ 2.70GHz",
+    "cpu_count": 12
+  },
+  "commit": "97f0bc9f55a4c5cd1bf018ea308167fe56ea6ca1",
+  "dirty": false,
+  "params": {
+    "target": "mock",
+    "mode": "concurrent",
+    "items": 200,
+    "repeats": 3,
+    "latency_ms": 50.0,
+    "concurrency": 50,
+    "workers": 2,
+    "batch_size": 50,
+    "flush_interval_s": 1.0,
+    "raw_queue_maxsize": 100
+  },
+  "repeats": [
+    {
+      "duration_s": 0.7609419690015784,
+      "items_requested": 200,
+      "ingested": 200,
+      "invalid": 0,
+      "missing": 0,
+      "failed": false,
+      "error": null,
+      "client_cpu_s": 0.6434234209999999,
+      "peak_in_flight": 50,
+      "blocked_puts": 0,
+      "flushes": 5,
+      "items_per_s": 262.8321319461684
+    },
+    {
+      "duration_s": 0.8711333589999413,
+      "items_requested": 200,
+      "ingested": 200,
+      "invalid": 0,
+      "missing": 0,
+      "failed": false,
+      "error": null,
+      "client_cpu_s": 0.7563438200000001,
+      "peak_in_flight": 50,
+      "blocked_puts": 0,
+      "flushes": 5,
+      "items_per_s": 229.58597318509243
+    },
+    {
+      "duration_s": 0.8262007530011033,
+      "items_requested": 200,
+      "ingested": 200,
+      "invalid": 0,
+      "missing": 0,
+      "failed": false,
+      "error": null,
+      "client_cpu_s": 0.7071428290000001,
+      "peak_in_flight": 50,
+      "blocked_puts": 0,
+      "flushes": 5,
+      "items_per_s": 242.07191687191906
+    }
+  ],
+  "summary": {
+    "median_duration_s": 0.8262007530011033,
+    "median_items_per_s": 242.07191687191906,
+    "error_rate": 0.0
+  }
+}

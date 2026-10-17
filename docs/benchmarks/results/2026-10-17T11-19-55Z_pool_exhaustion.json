@@ -1,0 +1,58 @@
+{
+  "benchmark": "pool_exhaustion",
+  "phase": 2,
+  "started_at": "2026-10-17T11:19:55.057271+00:00",
+  "machine": {
+    "platform": "Linux-6.8.0-138-generic-x86_64-with-glibc2.35",
+    "python": "3.12.13",
+    "cpu": "11th Gen Intel(R) Core(TM) i5-11400H @ 2.70GHz",
+    "cpu_count": 12
+  },
+  "commit": "97f0bc9f55a4c5cd1bf018ea308167fe56ea6ca1",
+  "dirty": false,
+  "scenarios": [
+    {
+      "name": "sized (W+1)",
+      "workers": 4,
+      "pool_size": 5,
+      "hold_s": 0.2,
+      "acquire_timeout_s": 5,
+      "wall_s": 0.209,
+      "acquire_waits_s": [
+        0.0,
+        0.004,
+        0.005,
+        0.005
+      ],
+      "timeouts": 0
+    },
+    {
+      "name": "pool=1, patient",
+      "workers": 4,
+      "pool_size": 1,
+      "hold_s": 0.2,
+      "acquire_timeout_s": 5,
+      "wall_s": 0.811,
+      "acquire_waits_s": [
+        0.0,
+        0.202,
+        0.404,
+        0.608
+      ],
+      "timeouts": 0
+    },
+    {
+      "name": "pool=1, timeout",
+      "workers": 4,
+      "pool_size": 1,
+      "hold_s": 0.2,
+      "acquire_timeout_s": 0.3,
+      "wall_s": 0.406,
+      "acquire_waits_s": [
+        0.0,
+        0.203
+      ],
+      "timeouts": 2
+    }
+  ]
+}
