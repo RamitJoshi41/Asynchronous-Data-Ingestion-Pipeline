@@ -1,3 +1,4 @@
+import asyncio
 import json
 from collections.abc import AsyncIterator
 
@@ -206,3 +207,26 @@ async def test_stop_ends_run_after_current_item_as_cancelled(
     assert summary.counts.fetched == 1  # item 1 finished; 4 and 7 never requested
     row = await migrated_pool.fetchrow("SELECT status, items_inserted FROM ingestion_runs")
     assert row is not None and (row["status"], row["items_inserted"]) == ("cancelled", 1)
+
+
+async def test_forced_cancellation_is_recorded_then_reraised(
+    store: Store, client: httpx.AsyncClient, respx_mock: respx.MockRouter, migrated_pool: DbPool
+) -> None:
+    respx_mock.get(f"{BASE}/topstories.json").respond(json=[1, 2])
+    in_request = asyncio.Event()
+
+    async def hang(request: httpx.Request) -> httpx.Response:
+        in_request.set()
+        await asyncio.sleep(10)
+        return httpx.Response(200, json={"id": 1})
+
+    respx_mock.get(f"{BASE}/item/1.json").mock(side_effect=hang)
+    task = asyncio.create_task(run_sequential(store, client, hn(2)))
+    await in_request.wait()
+    task.cancel()  # what a second Ctrl-C does
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    row = await migrated_pool.fetchrow("SELECT status, error, requests FROM ingestion_runs")
+    assert row is not None
+    assert (row["status"], row["error"]) == ("cancelled", "forced cancellation")
+    assert row["requests"] == 2  # topstories + the cancelled attempt, still timed

@@ -8,7 +8,7 @@ CLAUDE.md already fixes the shape of.
 from functools import lru_cache
 from typing import Literal, Self
 
-from pydantic import Field, SecretStr, model_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -90,6 +90,13 @@ class Settings(BaseSettings):
         default=["patiala:30.34:76.39", "delhi:28.61:77.21", "london:51.51:-0.13"], min_length=1
     )
     open_meteo_concurrency: int = Field(default=2, ge=1, le=20)
+
+    @field_validator("github_token", mode="before")
+    @classmethod
+    def _empty_token_is_no_token(cls, value: object) -> object:
+        # compose passes GITHUB_TOKEN="" when the variable is unset in the shell; that must not
+        # become an `Authorization: Bearer ` header.
+        return None if value == "" else value
 
     @model_validator(mode="after")
     def _pool_fits_workers(self) -> Self:

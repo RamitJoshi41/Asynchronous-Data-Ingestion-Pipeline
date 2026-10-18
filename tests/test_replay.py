@@ -82,3 +82,20 @@ async def test_second_replay_changes_nothing(store: Store, migrated_pool: DbPool
 async def test_replay_with_nothing_open_is_a_successful_no_op(store: Store) -> None:
     summary = await replay_dead_letters(store, HN)
     assert summary.status is RunStatus.SUCCEEDED and summary.counts.fetched == 0
+
+
+async def test_replay_failure_is_recorded_and_reraised(
+    store: Store, migrated_pool: DbPool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await seed(store)
+
+    async def broken_flush(*args: object) -> object:
+        raise RuntimeError("db went away")
+
+    monkeypatch.setattr(store, "flush", broken_flush)
+    with pytest.raises(RuntimeError, match="db went away"):
+        await replay_dead_letters(store, HN)
+    row = await migrated_pool.fetchrow(
+        "SELECT status, kind, error FROM ingestion_runs WHERE kind = 'replay'"
+    )
+    assert row is not None and row["status"] == "failed" and "db went away" in row["error"]

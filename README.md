@@ -2,63 +2,31 @@
 
 A headless Python 3.12 service that ingests data from a fixed set of public APIs (Hacker News, GitHub
 and Open-Meteo). It validates every record with strict Pydantic v2 schemas,
-upserts clean rows into PostgreSQL (skipping unchanged rows), records every run, and is being built
-up phase by phase into a concurrent, failure-tolerant pipeline with a small FastAPI status layer.
+upserts clean rows into PostgreSQL (skipping unchanged rows), dead-letters bad records instead of
+crashing, and records every run with latency and queue metrics. A small FastAPI layer lists runs and
+triggers new ones. Built in six measured phases as a learning and portfolio project.
 
-> **Status: Phase 5 of 6.** Three sources (Hacker News, GitHub issues/PRs, Open-Meteo forecasts) run
-> through one source-agnostic, concurrent, reliable pipeline, each with its own limits; GitHub is
-> incremental via watermarks. Every run records latency percentiles and queue/in-flight gauges, and a
-> FastAPI layer lists runs and triggers new ones (409 if a source is already running anywhere).
-> One-command Docker and CI are *planned* (Phase 6).
+> **Status: complete (Phase 6 of 6).** Three sources behind one source-agnostic, concurrent, reliable
+> pipeline; incremental GitHub ingestion via watermarks; per-source limits and an overlap guard;
+> `docker compose up` runs the whole thing; CI runs lint, strict typing and 334 tests (97% coverage)
+> against a real Postgres.
 
 ## Architecture
 
-**Now (Phase 4):**
-
 ```mermaid
 flowchart LR
-    CLI["python -m ingest run hn|github|open-meteo|all<br/>Ctrl-C: 1st drain all, 2nd cancel"] --> RS["runner.run_sources()<br/>one DB pool Σ(W+1), one StopSignal"]
-    RS --> P1["run_concurrent(HN connector)<br/>own httpx client, C=10"]
-    RS --> P2["run_concurrent(GitHub connector)<br/>own client + token, C=2"]
-    RS --> P3["run_concurrent(Open-Meteo connector)<br/>own client, C=2"]
-    subgraph PIPE["each pipeline instance (same core code)"]
-        PLAN["connector.plan(watermarks)"] --> JQ[("job_queue<br/>bounded")]
-        JQ --> F["C fetchers<br/>job_pages: pages in order<br/>Retrier + connector rate-limit hook"]
-        F --> RQ[("raw_queue<br/>pages, bounded")]
-        RQ --> W["W workers<br/>classify: connector.parse<br/>exact batch_size chunks"]
-    end
-    P2 -.-> PIPE
-    F -- "GET (Link next, same-origin only)" --> API["HN · GitHub · Open-Meteo"]
-    W -- "flush: ONE transaction" --> TX{{"upsert items (skip unchanged)<br/>resolve dead letters<br/>upsert rejects"}}
-    TX --> ITEMS[("items")]
-    TX --> DLQ[("dead_letter")]
-    PIPE -- "succeeded only, same txn as status" --> WM[("source_watermarks<br/>per (source, key)")]
-    WM -. "since=" .-> PLAN
-    PIPE --> RUNS[("ingestion_runs<br/>one row per source per run")]
+    CLI["CLI: python -m ingest run hn|github|open-meteo|all"] --> RS
+    API["FastAPI: POST /trigger (409 if busy)<br/>GET /runs, /runs/{id}, /health"] --> RS
+    RS["runner.run_sources<br/>advisory lock per source · one DB pool · one StopSignal"] --> P["one pipeline instance per source<br/>own httpx client + fetcher limit"]
+    P --> PLAN["connector.plan(watermarks)"] --> JQ[("job queue<br/>bounded")]
+    JQ --> F["C fetchers<br/>pages in order · retries, jitter, Retry-After,<br/>per-source rate-limit gate"]
+    F <-->|HTTP| SRC["Hacker News · GitHub · Open-Meteo"]
+    F --> RQ[("page queue<br/>bounded")] --> W["W workers<br/>strict Pydantic validation<br/>exact-size batches"]
+    W -->|"one transaction per batch"| DB[("PostgreSQL<br/>items (skip-unchanged upsert)<br/>dead_letter · source_watermarks<br/>ingestion_runs + metrics")]
+    P -->|"p50/p95 latency, gauges, status,<br/>watermarks only on success"| DB
+    API -->|reads| DB
 ```
-
-**Target (planned):**
-
-```mermaid
-flowchart LR
-    subgraph SRC["Sources"]
-        HN[Hacker News API]
-        GH[GitHub REST API]
-        OM[Open-Meteo API]
-    end
-    F["fetchers<br/>httpx AsyncClient · Semaphore · retries"]
-    Q[("bounded asyncio.Queue")]
-    W["worker tasks<br/>parse + Pydantic validate"]
-    B["batch buffer"]
-    DB[("PostgreSQL<br/>items · dead_letter · ingestion_runs")]
-    API["FastAPI<br/>GET /runs · /runs/{id} · /health<br/>POST /trigger (overlap-guarded)"]
-    HN & GH & OM --> F --> Q --> W
-    W -- valid --> B -- "bulk upsert<br/>skip unchanged" --> DB
-    W -- invalid --> DB
-    F & W -. "counts, retries, p95" .-> DB
-    API --> DB
-```
-
+Sources: [docs/diagrams](docs/diagrams) (one diagram per phase is kept locally).
 
 ## Features
 
@@ -89,7 +57,17 @@ flowchart LR
 
 ## Quickstart
 
-Requires [uv](https://docs.astral.sh/uv/) and Docker with the compose plugin.
+**One command** (Docker with the compose plugin):
+
+```bash
+docker compose up --build        # Postgres → migrations (once) → API on http://localhost:8000
+curl -X POST localhost:8000/trigger -H 'content-type: application/json' -d '{"sources": ["all"]}'
+curl localhost:8000/runs
+docker compose run --rm app run all     # or a CLI run in a one-off container
+```
+`GITHUB_TOKEN` is read from your shell if set (optional; 60 requests/hour without it).
+
+**Local development** (needs [uv](https://docs.astral.sh/uv/)):
 
 ```bash
 uv sync                                   # .venv with runtime + dev deps
@@ -105,7 +83,6 @@ uv run python -m ingest serve                               # API on http://127.
 uv run python -m ingest.toy_pipeline      # Phase 0 concurrency simulation
 ```
 
-A one-command `docker compose up` for the whole app is planned for Phase 6.
 
 ## Configuration
 
@@ -172,36 +149,39 @@ added with a diff of 5 files, 344 insertions, 0 deletions.
 docker compose up -d --wait db            # tests need the real Postgres
 uv run ruff check . && uv run ruff format --check .
 uv run mypy
-uv run pytest -q
+uv run pytest -q --cov          # 334 tests, 97% line coverage (floor: 94%)
 ```
 
 Tests never hit real public APIs (respx fails any unmocked request). DB tests use database
-`ingest_test` with a fresh schema per test.
+`ingest_test` with a fresh schema per test. Shutdown is tested by sending real SIGINTs to a real CLI
+process. GitHub Actions ([ci.yml](.github/workflows/ci.yml)) runs the same gate against Postgres 16, plus a
+job that brings up `docker compose` and checks `/health`. Important guarantees were mutation-checked
+(break the feature, confirm a test fails).
 
 ## Benchmarks
 
-Measured 2026-10-17 on an i5-11400H laptop ([methodology, raw JSON, caveats](docs/BENCHMARKS.md)).
-Local mock with 50 ms injected latency, 200 items, 3 repeats, medians:
+Local mock HN server with 50 ms injected latency, 200 items, 3 repeats, medians, i5-11400H laptop
+([methodology, raw JSON, caveats](docs/BENCHMARKS.md)). Two measurements of the same matrix:
 
-| Mode | Duration | Throughput | Speedup | Error rate |
-|---|---|---|---|---|
-| sequential (Phase 1 runner) | 11.577 s | 17.3 items/s | 1.0× | 0 |
-| concurrent, C = 5 | 2.279 s | 87.8 items/s | 5.1× | 0 |
-| concurrent, C = 20 | 0.658 s | 303.9 items/s | 17.6× | 0 |
-| concurrent, C = 50 | 0.826 s | 242.1 items/s | 14.0× | 0 |
-| concurrent, C = 20, Phase 3 reliability layer | 0.630 s | 317.7 items/s | 18.4× | 0 |
-| concurrent, C = 20, Phase 4 connector refactor (two sets) | 0.651 s / 0.627 s | 307.4 / 319.2 items/s | 17.8× / 18.5× | 0 |
-| concurrent, C = 20, Phase 5 metrics + gauges | 0.637 s | 313.9 items/s | 18.2× | 0 |
+| Mode | Phase 2 (2026-10-17) | Final, Phase 6 (2026-10-18, **on battery**) | Error rate |
+|---|---|---|---|
+| sequential | 11.577 s · 17.3 items/s | 11.616 s · 17.2 items/s | 0 |
+| concurrent, C = 5 | 2.279 s · **5.1×** | 2.350 s · **4.9×** | 0 |
+| concurrent, C = 20 | 0.658 s · **17.6×** | 0.700 s · **16.6×** | 0 |
+| concurrent, C = 50 | 0.826 s · 14.0× | 1.409 s · 8.2× | 0 |
 
-C = 50 is *slower* than C = 20: the client becomes CPU-bound in httpcore's connection-pool
-bookkeeping (O(connections²) per request event, found by profiling).
+C = 50 is *slower* than C = 20 in both: the client becomes CPU-bound in httpcore's connection-pool
+bookkeeping (O(connections²) per request event, found by profiling). The final run was on battery
+(`powersave`, ~2.7 of 4.5 GHz), which roughly doubled client CPU time and hit the CPU-bound C = 50 case
+hardest. Between them, each phase re-measured C = 20 to show its features cost nothing measurable
+(0.630 / 0.627–0.651 / 0.637 s).
 
 **Under injected faults** (10% 500s, 1% 429 with `Retry-After: 1`, C = 20): without retries every
 run failed; with a 4-attempt budget, 2 of 3 runs ingested all 200 items (24–27 retries, 2.3–4.2 s),
 and one failed when a single item hit four 500s in a row (≈3% expected per run at this fault rate).
 
-Real HN API, one run each: sequential 30 items in 12.762 s vs concurrent C = 5 in 3.931 s (different
-times of day, so indicative only). Mock numbers describe this laptop with a fixed artificial delay.
+Real HN API, one run each: sequential 30 items in 12.762 s vs concurrent C = 5 in 3.931 s (Phase 2) and
+4.229 s (Phase 6). Internet timing on different days, so indicative only. Mock numbers describe this laptop with a fixed artificial delay.
 
 After the Phase 4 refactor the sequential baseline measured 11.304 s (17.7 items/s): no measurable cost
 from the connector abstraction. The new sources aren't benchmarked yet (Phase 6).
@@ -283,7 +263,8 @@ src/ingest/
   db.py, migrate.py  asyncpg pool; migration runner;  migrations/*.sql  the schema
   toy_pipeline.py    Phase 0 simulation
 benchmarks/          mock HN server (with fault injection), benchmark harness, pool-exhaustion experiment
+Dockerfile           app image (uv, locked deps, non-root); compose.yaml runs db + migrate + app
+.github/workflows/   CI: lint, mypy, tests + coverage, docker compose smoke test
 tests/               pytest (asyncio auto mode, respx, real Postgres)
-compose.yaml         Postgres 16 for dev/tests
 docs/                BENCHMARKS.md (methodology) + benchmarks/results/*.json (raw results)
 ```

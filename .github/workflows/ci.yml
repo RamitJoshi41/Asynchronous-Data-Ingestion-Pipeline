@@ -1,0 +1,70 @@
+# CI: the same gate as locally (ruff, format, mypy strict, pytest + coverage floor) against a real
+# Postgres 16, plus a job that proves the one-command Docker run serves a healthy API.
+# Tests never call real public APIs (respx), so CI needs no secrets.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: ingest
+          POSTGRES_PASSWORD: ingest
+          POSTGRES_DB: ingest
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U ingest -d ingest"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 15
+    env:
+      # conftest.py creates this database on first use and gives every test its own schema.
+      TEST_DB_DSN: postgresql://ingest:ingest@localhost:5432/ingest_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          version: "0.11.3"
+      - name: Install (locked)
+        run: uv sync --locked
+      - name: Lint
+        run: uv run ruff check . && uv run ruff format --check .
+      - name: Type-check
+        run: uv run mypy
+      - name: Tests + coverage
+        run: uv run pytest -q --cov --cov-report=term
+
+  docker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: One-command run
+        run: docker compose up -d --build
+      - name: API is healthy and serves runs
+        run: |
+          for i in $(seq 1 60); do
+            if curl -fsS http://localhost:8000/health; then break; fi
+            sleep 2
+          done
+          curl -fsS http://localhost:8000/health | grep '"database":"ok"'
+          curl -fsS http://localhost:8000/runs
+      - name: Logs on failure
+        if: failure()
+        run: docker compose logs
+      - name: Tear down
+        if: always()
+        run: docker compose down -v

@@ -26,6 +26,7 @@ dev = [
     "ruff==0.16.9",
     "respx>=0.23.1",
     "asyncpg-stubs>=0.32.0",
+    "pytest-cov>=7.0",
 ]
 
 [tool.hatch.build.targets.wheel]
@@ -52,3 +53,12 @@ line-length = 100
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP", "ASYNC"]
+
+[tool.coverage.run]
+source = ["ingest"]
+
+[tool.coverage.report]
+# Measured 97% at the start of Phase 6. The floor stops silent erosion without punishing refactors.
+fail_under = 94
+skip_covered = true
+show_missing = true

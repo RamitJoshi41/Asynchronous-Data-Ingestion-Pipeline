@@ -16,6 +16,7 @@ recorded hashes map to these published commits:
 | `97f0bc9` | `ad43183` | concurrent mode + pool experiment (Phase 2 results) |
 | `95847d9` | the Phase 4 commit (amended to add these results; trees identical: `src` 78dbf77, `benchmarks` a5d1f21) | Phase 4 regression results |
 | `bf844cd` | the Phase 5 commit (amended to add results; `src` tree e924aab identical) | Phase 5 regression result |
+| `1f14b12` | the Phase 6 commit (amended to add results and README; `src`/`benchmarks` trees identical) | Phase 6 final matrix |
 
 ## Methodology
 
@@ -193,6 +194,32 @@ Every HTTP attempt is now timed and a sampler task reads queue depth and in-flig
 mock workload, C = 20: repeats 0.637 / 0.655 / 0.620 s, **median 0.637 s** (313.9 items/s), client CPU
 0.21–0.22 s, [json](benchmarks/results/2026-10-18T08-19-07Z_hn_concurrent_c20_mock.json). That's inside
 Phase 4's spread (0.621–0.673 s), so there's no measurable cost.
+
+## Phase 6: final matrix (2026-10-18)
+
+Measured at commit `1f14b12` (clean tree), mock with 50 ms latency, 200 items, 3 repeats, medians; plus one
+small real-API run. **Machine state: on battery, `powersave` governor, CPU at ~2.7 of 4.5 GHz** (read from
+`/sys` right after the run). Earlier phases didn't record power state.
+
+| Mode | Repeats (s) | Median | Throughput | Speedup | Client CPU (s) | Error rate | Raw |
+|---|---|---|---|---|---|---|---|
+| sequential | 11.616 / 11.423 / 11.721 | **11.616 s** | 17.2 items/s | 1.0× | 0.68–0.84 | 0.0 | [json](benchmarks/results/2026-10-18T09-05-45Z_hn_sequential_mock.json) |
+| concurrent C = 5 | 2.332 / 2.360 / 2.350 | **2.350 s** | 85.1 items/s | **4.9×** | 0.51–0.60 | 0.0 | [json](benchmarks/results/2026-10-18T09-06-21Z_hn_concurrent_c5_mock.json) |
+| concurrent C = 20 | 0.700 / 0.708 / 0.681 | **0.700 s** | 285.7 items/s | **16.6×** | 0.36–0.38 | 0.0 | [json](benchmarks/results/2026-10-18T09-06-29Z_hn_concurrent_c20_mock.json) |
+| concurrent C = 50 | 1.427 / 1.409 / 1.336 | **1.409 s** | 141.9 items/s | 8.2× | 1.23–1.32 | 0.0 | [json](benchmarks/results/2026-10-18T09-06-33Z_hn_concurrent_c50_mock.json) |
+| real HN API, C = 5 | 4.229 (1 run) | 4.229 s | 7.09 items/s | | 0.15 | 0.0 | [json](benchmarks/results/2026-10-18T09-06-38Z_hn_concurrent_c5_real.json) |
+
+**Reading the numbers**
+- The shape matches Phase 2: near-linear speedup to C = 20, then a *slowdown* at C = 50, where the client
+  becomes CPU-bound in httpcore's O(connections²) pool bookkeeping (profiled in Phase 2).
+- Absolute numbers are worse than Phase 5's same-code C = 20 (0.637 s, 0.21 s CPU): the only source change
+  since then is a config validator (`git diff c849fc2 1f14b12 -- src`). Client CPU *seconds* roughly doubled
+  for the same work, which fits a throttled CPU. C = 50, the CPU-bound case, suffers most (8.2× vs Phase 2's
+  14.0×). Treat this table as "the same laptop on battery". Re-run on AC power with the commands in
+  Methodology to compare.
+- Error rate is 0 everywhere. The fault-injection results (Phase 3) are the reliability evidence.
+- Real run: 30 items at C = 5 in 4.23 s (Phase 2: 3.93 s; Phase 1 sequential: 12.76 s). Internet timing on
+  different days, so indicative only.
 
 ## Planned
 

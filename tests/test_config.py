@@ -123,3 +123,8 @@ def test_github_repos_must_be_owner_slash_repo(monkeypatch: pytest.MonkeyPatch, 
     monkeypatch.setenv("GITHUB_REPOS", bad)
     with pytest.raises(ValidationError, match="owner/repo"):
         Settings(_env_file=None)
+
+
+def test_empty_github_token_means_no_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("GITHUB_TOKEN", "")  # what compose passes when the variable is unset
+    assert Settings(_env_file=None).github_token is None

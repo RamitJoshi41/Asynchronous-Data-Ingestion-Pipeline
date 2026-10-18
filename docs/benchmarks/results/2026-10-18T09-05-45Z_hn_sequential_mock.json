@@ -1,0 +1,82 @@
+{
+  "benchmark": "hn_sequential",
+  "phase": 5,
+  "started_at": "2026-10-18T09:05:45.144996+00:00",
+  "machine": {
+    "platform": "Linux-6.8.0-138-generic-x86_64-with-glibc2.35",
+    "python": "3.12.13",
+    "cpu": "11th Gen Intel(R) Core(TM) i5-11400H @ 2.70GHz",
+    "cpu_count": 12
+  },
+  "commit": "1f14b120b9dca249e78212c1beaa894c35613cb2",
+  "dirty": false,
+  "trees": {
+    "src": "867e0dc59051dfd957e116fd847b937f4a5f88d1",
+    "benchmarks": "1694835fc66ae8ab47f83757b25377460735585b",
+    "pyproject.toml": "bda9bcfdf8e3ad9a4d2c95e2dee0483d9ee0ff57",
+    "uv.lock": "4d357a809e738d20318f436c1511ec1e014e475c"
+  },
+  "params": {
+    "target": "mock",
+    "mode": "sequential",
+    "items": 200,
+    "repeats": 3,
+    "retry_max_attempts": 4,
+    "latency_ms": 50.0,
+    "fail_rate": 0.0,
+    "rate_limit_rate": 0.0,
+    "seed": 0
+  },
+  "repeats": [
+    {
+      "duration_s": 11.616059574000246,
+      "items_requested": 200,
+      "ingested": 200,
+      "invalid": 0,
+      "missing": 0,
+      "failed": false,
+      "error": null,
+      "client_cpu_s": 0.7784421539999999,
+      "peak_in_flight": 1,
+      "blocked_puts": 0,
+      "flushes": 200,
+      "retries": 0,
+      "items_per_s": 17.217542551835034
+    },
+    {
+      "duration_s": 11.42336510700079,
+      "items_requested": 200,
+      "ingested": 200,
+      "invalid": 0,
+      "missing": 0,
+      "failed": false,
+      "error": null,
+      "client_cpu_s": 0.6808783789999999,
+      "peak_in_flight": 1,
+      "blocked_puts": 0,
+      "flushes": 200,
+      "retries": 0,
+      "items_per_s": 17.507975813311816
+    },
+    {
+      "duration_s": 11.721318554999925,
+      "items_requested": 200,
+      "ingested": 200,
+      "invalid": 0,
+      "missing": 0,
+      "failed": false,
+      "error": null,
+      "client_cpu_s": 0.8359865560000004,
+      "peak_in_flight": 1,
+      "blocked_puts": 0,
+      "flushes": 200,
+      "retries": 0,
+      "items_per_s": 17.062926757048732
+    }
+  ],
+  "summary": {
+    "median_duration_s": 11.616059574000246,
+    "median_items_per_s": 17.217542551835034,
+    "error_rate": 0.0
+  }
+}

@@ -1,5 +1,15 @@
-# Phase 1: only the database. The app service arrives in Phase 6 (one-command run).
+# One-command run (Phase 6): `docker compose up --build` → Postgres, migrations once, API on :8000.
+# CLI runs: `docker compose run --rm app run all`. Tests use only the `db` service.
 # Explainer: docs/explain/compose.md
+x-app: &app
+  build: .
+  image: pipeline:local
+  environment:
+    # Inside the compose network the database is `db:5432` (5433 is only the host-side port).
+    DB_DSN: postgresql://ingest:ingest@db:5432/ingest
+    GITHUB_TOKEN: ${GITHUB_TOKEN:-}  # optional; read from your shell, never committed
+    LOG_FORMAT: ${LOG_FORMAT:-json}
+
 services:
   db:
     image: postgres:16
@@ -17,6 +27,23 @@ services:
       interval: 2s
       timeout: 3s
       retries: 15
+
+  migrate:
+    <<: *app
+    command: ["migrate"]
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: "no"
+
+  app:
+    <<: *app
+    command: ["serve", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "8000:8000"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
 
 volumes:
   pgdata:
