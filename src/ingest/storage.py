@@ -69,8 +69,28 @@ _FINISH_RUN = """
 UPDATE ingestion_runs
 SET status = $2, finished_at = now(),
     items_fetched = $3, items_inserted = $4, items_updated = $5,
-    items_unchanged = $6, items_invalid = $7, items_missing = $8, retries = $9, error = $10
+    items_unchanged = $6, items_invalid = $7, items_missing = $8, retries = $9, error = $10,
+    duration_ms = $11, requests = $12, latency_p50_ms = $13, latency_p95_ms = $14,
+    latency_max_ms = $15, queue_depth_peak = $16, queue_depth_mean = $17,
+    in_flight_peak = $18, in_flight_mean = $19
 WHERE id = $1 AND status = 'running'
+"""
+
+# Only called while holding the source's advisory lock (runner.SourceLocks): any other 'running' row
+# for the source then belongs to a process that died without finishing it (ADR-0036).
+_ABANDON_STALE = """
+UPDATE ingestion_runs SET status = 'failed', finished_at = now(), error = 'abandoned: ' || $2
+WHERE source = $1 AND status = 'running'
+RETURNING id
+"""
+
+_GET_RUN = "SELECT * FROM ingestion_runs WHERE id = $1"
+
+# Keyset pagination, newest first: `before_id` is the last id of the previous page.
+_LIST_RUNS = """
+SELECT * FROM ingestion_runs
+WHERE ($1::text IS NULL OR source = $1) AND ($2::bigint IS NULL OR id < $2)
+ORDER BY id DESC LIMIT $3
 """
 
 
@@ -131,6 +151,21 @@ class FlushResult:
     resolved: int  # open dead letters closed because their record now ingested cleanly
 
 
+@dataclass(frozen=True)
+class RunMetrics:
+    """Phase 5 run metrics (ADR-0038). Gauge fields are None for the sequential runner."""
+
+    duration_ms: int
+    requests: int
+    latency_p50_ms: float | None = None
+    latency_p95_ms: float | None = None
+    latency_max_ms: float | None = None
+    queue_depth_peak: int | None = None
+    queue_depth_mean: float | None = None
+    in_flight_peak: int | None = None
+    in_flight_mean: float | None = None
+
+
 @dataclass
 class RunCounts:
     """What happened to every item a run fetched. Mutable: the runner increments it."""
@@ -176,6 +211,7 @@ class Store:
         error: str | None = None,
         *,
         watermarks: Mapping[str, str] | None = None,
+        metrics: RunMetrics | None = None,
     ) -> None:
         """Finalise the run; a succeeded run also advances its watermarks, atomically (ADR-0031)."""
         if status is RunStatus.RUNNING:
@@ -198,6 +234,7 @@ class Store:
                 counts.missing,
                 counts.retries,
                 None if error is None else error[:MAX_ERROR_CHARS],
+                *(_metric_values(metrics)),
             )
             # "UPDATE 0": the run doesn't exist or was already finished, a logic bug upstream.
             # Raising inside the transaction also rolls back (and so skips) the watermarks.
@@ -207,6 +244,23 @@ class Store:
                 await conn.execute(
                     _ADVANCE_WATERMARKS, run_id, list(watermarks), list(watermarks.values())
                 )
+
+    async def abandon_stale_runs(self, source: str, reason: str) -> list[int]:
+        async with self._pool.acquire(timeout=self._acquire_timeout) as conn:
+            rows = await conn.fetch(_ABANDON_STALE, source, reason)
+        return [r["id"] for r in rows]
+
+    async def get_run(self, run_id: int) -> dict[str, object] | None:
+        async with self._pool.acquire(timeout=self._acquire_timeout) as conn:
+            row = await conn.fetchrow(_GET_RUN, run_id)
+        return None if row is None else dict(row)
+
+    async def list_runs(
+        self, *, source: str | None, before_id: int | None, limit: int
+    ) -> list[dict[str, object]]:
+        async with self._pool.acquire(timeout=self._acquire_timeout) as conn:
+            rows = await conn.fetch(_LIST_RUNS, source, before_id, limit)
+        return [dict(r) for r in rows]
 
     async def watermarks(self, source: str) -> dict[str, str]:
         async with self._pool.acquire(timeout=self._acquire_timeout) as conn:
@@ -273,3 +327,19 @@ class Store:
         async with self._pool.acquire(timeout=self._acquire_timeout) as conn:
             rows = await conn.fetch(_OPEN_DEAD_LETTERS, source, after_id, limit)
         return [OpenDeadLetter(r["id"], r["source_id"], bytes(r["raw_body"])) for r in rows]
+
+
+def _metric_values(metrics: RunMetrics | None) -> tuple[object, ...]:
+    if metrics is None:
+        return (None,) * 9
+    return (
+        metrics.duration_ms,
+        metrics.requests,
+        metrics.latency_p50_ms,
+        metrics.latency_p95_ms,
+        metrics.latency_max_ms,
+        metrics.queue_depth_peak,
+        metrics.queue_depth_mean,
+        metrics.in_flight_peak,
+        metrics.in_flight_mean,
+    )

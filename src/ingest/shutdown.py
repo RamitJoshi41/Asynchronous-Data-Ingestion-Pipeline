@@ -31,19 +31,29 @@ class StopSignal:
     async def wait(self) -> None:
         await self._event.wait()
 
-    def on_stop(self, callback: Callable[[], None]) -> None:
-        """Run `callback` when stop is requested (immediately if it already was)."""
+    def on_stop(self, callback: Callable[[], None]) -> Callable[[], None]:
+        """Run `callback` when stop is requested (immediately if it already was).
+
+        Returns an unsubscribe function. The API shares one StopSignal across many runs, so each run
+        must remove its callback when it ends, or finished runs would stay referenced forever.
+        """
         if self._event.is_set():
             callback()
-        else:
-            self._callbacks.append(callback)
+            return lambda: None
+        self._callbacks.append(callback)
+
+        def unsubscribe() -> None:
+            if callback in self._callbacks:
+                self._callbacks.remove(callback)
+
+        return unsubscribe
 
     def request(self, reason: str) -> None:
         if self._event.is_set():
             return
         self.reason = reason
         self._event.set()
-        for callback in self._callbacks:
+        for callback in list(self._callbacks):
             callback()
 
 

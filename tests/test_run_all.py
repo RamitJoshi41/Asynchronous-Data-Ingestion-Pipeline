@@ -10,8 +10,9 @@ import pytest
 import respx
 from pydantic import SecretStr
 
-from ingest.__main__ import build_plans, migrate_command
+from ingest.__main__ import migrate_command
 from ingest.config import Settings
+from ingest.connectors.registry import build_plans
 from ingest.runner import run_sources
 from ingest.shutdown import StopSignal
 from ingest.storage import RunStatus

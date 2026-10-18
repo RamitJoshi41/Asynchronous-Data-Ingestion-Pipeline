@@ -71,7 +71,19 @@ async def pool(test_settings: Settings, schema: str) -> AsyncIterator[DbPool]:
     try:
         yield db_pool
     finally:
-        await db_pool.close()  # before the schema fixture drops the schema
+        await close_or_fail(db_pool)  # before the schema fixture drops the schema
+
+
+async def close_or_fail(db_pool: DbPool, timeout_s: float = 5.0) -> None:
+    """Close a pool, failing (instead of hanging) if a test leaked a checked-out connection.
+
+    asyncpg's Pool.close() waits for every acquired connection to be released, forever.
+    """
+    try:
+        await asyncio.wait_for(db_pool.close(), timeout_s)
+    except TimeoutError:
+        db_pool.terminate()
+        pytest.fail("a pooled connection was never released (leaked)")
 
 
 @pytest.fixture
@@ -79,3 +91,13 @@ async def migrated_pool(pool: DbPool, test_settings: Settings) -> DbPool:
     migrations = await asyncio.to_thread(load_migrations)
     await apply_migrations(pool, migrations, acquire_timeout=test_settings.db_acquire_timeout_s)
     return pool
+
+
+@pytest.fixture
+async def other_session(test_settings: Settings, schema: str) -> AsyncIterator[DbPool]:
+    """A second pool = other database sessions, standing in for a run in another process."""
+    db_pool = await create_pool(test_settings, search_path=schema)
+    try:
+        yield db_pool
+    finally:
+        await close_or_fail(db_pool)

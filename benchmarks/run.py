@@ -43,7 +43,7 @@ from ingest.runner import SourcePlan, pool_settings
 from ingest.sequential import RunSummary, run_sequential
 from ingest.storage import Store
 
-PHASE = 4  # the phase that produced new result files
+PHASE = 5  # the phase that produced new result files
 REAL_MAX_ITEMS, REAL_MAX_CONCURRENCY = 30, 10  # politeness caps for the real API
 RESULTS_DIR = Path(__file__).resolve().parent.parent / "docs" / "benchmarks" / "results"
 

@@ -7,6 +7,8 @@ from ingest.config import Settings
 # PEP 695 alias: evaluated lazily, so subscripting asyncpg.Pool (generic only in the stubs) is
 # safe at runtime.
 type DbPool = asyncpg.Pool[asyncpg.Record]
+# A connection lent out by the pool (asyncpg wraps it in a proxy), e.g. one held for a whole run.
+type PoolConnection = asyncpg.pool.PoolConnectionProxy[asyncpg.Record]
 
 
 async def create_pool(settings: Settings, *, search_path: str | None = None) -> DbPool:

@@ -5,9 +5,11 @@ and Open-Meteo). It validates every record with strict Pydantic v2 schemas,
 upserts clean rows into PostgreSQL (skipping unchanged rows), records every run, and is being built
 up phase by phase into a concurrent, failure-tolerant pipeline with a small FastAPI status layer.
 
-> **Status: Phase 4 of 6.** Three sources (Hacker News, GitHub issues/PRs, Open-Meteo forecasts) run
+> **Status: Phase 5 of 6.** Three sources (Hacker News, GitHub issues/PRs, Open-Meteo forecasts) run
 > through one source-agnostic, concurrent, reliable pipeline, each with its own limits; GitHub is
-> incremental via watermarks. Metrics and the API are *planned*.
+> incremental via watermarks. Every run records latency percentiles and queue/in-flight gauges, and a
+> FastAPI layer lists runs and triggers new ones (409 if a source is already running anywhere).
+> One-command Docker and CI are *planned* (Phase 6).
 
 ## Architecture
 
@@ -79,7 +81,10 @@ flowchart LR
 | Open-Meteo: daily forecast per city (added without touching core code) | Done (Phase 4) |
 | Watermarks: advanced only by a succeeded run, in the same transaction; GitHub resumes with `since` | Done (Phase 4) |
 | Per-source concurrency + HTTP client; `run all` with failure isolation | Done (Phase 4) |
-| Metrics, FastAPI endpoints, overlap guard | Planned: Phase 5 |
+| Run metrics: duration, attempts, exact p50/p95/max request latency, queue-depth and in-flight peak/mean | Done (Phase 5) |
+| FastAPI: `/health`, `/runs`, `/runs/{id}` (live gauges), `POST /trigger`; runs drain on API shutdown | Done (Phase 5) |
+| Overlap guard: per-source Postgres advisory lock (API 409, CLI exit 75); abandoned `running` rows cleaned up | Done (Phase 5) |
+| Structured logs: console or JSON (`LOG_FORMAT`), `run_id`/`source` on every run event | Done (Phase 5) |
 | One-command Docker Compose run, CI | Planned: Phase 6 |
 
 ## Quickstart
@@ -96,6 +101,7 @@ uv run python -m ingest run open-meteo
 uv run python -m ingest run all                             # every source at once, each with its own limits
 uv run python -m ingest run hn --limit 30 --sequential      # Phase 1 baseline runner
 uv run python -m ingest replay                              # re-validate dead letters (all sources)
+uv run python -m ingest serve                               # API on http://127.0.0.1:8000 (docs at /docs)
 uv run python -m ingest.toy_pipeline      # Phase 0 concurrency simulation
 ```
 
@@ -122,6 +128,9 @@ Environment variables (or a git-ignored `.env` in the working directory), define
 | `RETRY_BASE_DELAY_S` / `RETRY_MAX_DELAY_S` | `0.5` / `10` | full-jitter backoff window |
 | `RETRY_AFTER_MAX_S` | `60` | a longer `Retry-After` gives up instead of stalling |
 | `SHUTDOWN_GRACE_S` | `10` | drain deadline after SIGINT/SIGTERM |
+| `LOG_FORMAT` / `LOG_LEVEL` | `console` / `info` | `json` for machine-readable logs |
+| `GAUGE_INTERVAL_S` | `0.25` | queue-depth / in-flight sampling period |
+| `API_HOST` / `API_PORT` | `127.0.0.1` / `8000` | `serve` bind address |
 | `HN_BASE_URL` | `https://hacker-news.firebaseio.com/v0` | HN API base |
 | `HN_TOP_LIMIT` | `30` (1–500) | default number of top stories |
 | `HN_CONCURRENCY` | `10` (1–200) | HN fetcher pool size (httpx limits follow it) |
@@ -135,9 +144,19 @@ Environment variables (or a git-ignored `.env` in the working directory), define
 
 ## API endpoints
 
-Planned for Phase 5: `GET /runs`, `GET /runs/{id}`, `GET /health`, `POST /trigger` (409 if a run is
-already active). Until then, inspect runs in SQL:
-`SELECT * FROM ingestion_runs ORDER BY id DESC;`
+`uv run python -m ingest serve` (interactive docs at `/docs`). Runs triggered here execute in the API's
+own event loop and DB pool; stopping the API drains them (recorded `cancelled`).
+
+| Endpoint | Returns |
+|---|---|
+| `GET /health` | `{"status": "ok", "database": "ok", "active_runs": 0}`; 503 if the DB is unreachable |
+| `GET /runs?source=&limit=20&before_id=` | runs, newest first (keyset paging with `before_id`) |
+| `GET /runs/{id}` | one run with counts and metrics, plus `live` gauges while it's running; 404 if unknown |
+| `POST /trigger` `{"sources": ["hn", "open-meteo"]}` (or `["all"]`) | **202** `{"runs": {"hacker_news": 15, "open_meteo": 16}}`; **409** if a source is already running (here or in a CLI process); 422 for unknown sources |
+
+Real example (2026-10-18), `GET /runs/15` after a triggered HN run:
+`status=succeeded, items_fetched=30, requests=31, duration_ms=3515, latency_p50_ms≈373,
+latency_p95_ms≈1054, in_flight_peak=10`.
 
 ## Adding a source
 
@@ -172,6 +191,7 @@ Local mock with 50 ms injected latency, 200 items, 3 repeats, medians:
 | concurrent, C = 50 | 0.826 s | 242.1 items/s | 14.0× | 0 |
 | concurrent, C = 20, Phase 3 reliability layer | 0.630 s | 317.7 items/s | 18.4× | 0 |
 | concurrent, C = 20, Phase 4 connector refactor (two sets) | 0.651 s / 0.627 s | 307.4 / 319.2 items/s | 17.8× / 18.5× | 0 |
+| concurrent, C = 20, Phase 5 metrics + gauges | 0.637 s | 313.9 items/s | 18.2× | 0 |
 
 C = 50 is *slower* than C = 20: the client becomes CPU-bound in httpcore's connection-pool
 bookkeeping (O(connections²) per request event, found by profiling).
@@ -216,6 +236,9 @@ from the connector abstraction. The new sources aren't benchmarked yet (Phase 6)
 | Run crashes / fails / is cancelled | no succeeded status | watermark unchanged; next run re-reads the overlap, skip-unchanged makes it free | `test_failed_run_leaves_every_watermark_unchanged`, `test_watermark_and_succeeded_status_commit_together` |
 | One source fails during `run all` | per-source isolation | other sources finish; exit code 1 | `test_a_failing_source_does_not_cancel_the_others` |
 | `Link` header points to another host | same-origin check | refused (token never leaves GitHub) | `test_a_link_to_another_host_is_refused`, `test_the_token_is_never_sent_to_another_host` |
+| Same source triggered twice / CLI + API at once | advisory lock per source | 409 from the API, exit 75 from the CLI; nothing starts | `test_live_gauges_while_running_then_409_for_a_second_trigger`, `test_409_when_another_process_holds_the_source`, `test_cli_run_refuses_a_busy_source` |
+| Process killed mid-run (SIGKILL) | lock is free but row says `running` | next start of that source marks it `failed` ("abandoned") | `test_a_dead_sessions_lock_is_released_by_postgres`, `test_stale_running_rows_are_abandoned_when_the_lock_is_free` |
+| API stopped with runs active | lifespan exit | runs drain and are recorded `cancelled` | `test_shutdown_drains_active_runs` |
 | Second Ctrl-C | signal handler | immediate cancel; the in-progress batch still lands and is counted; `cancelled` | `test_second_sigint_forces_immediate_exit`, `test_forced_cancellation_lets_the_in_progress_batch_land` |
 
 
@@ -224,8 +247,10 @@ from the connector abstraction. The new sources aren't benchmarked yet (Phase 6)
 - A record whose retries are exhausted fails the whole run (by design: the source is unhealthy). An
   idempotent re-run converges, but there's no per-run dead-letter cap or circuit breaker yet.
 - On a *forced* stop, records buffered in workers but not yet being written are lost (re-fetched on
-  the next run). A graceful drain flushes them. A killed process (SIGKILL) or a dead DB can still leave a
-  `running` row.
+  the next run). A graceful drain flushes them. A killed process (SIGKILL) leaves a `running`
+  row until the next run of that source marks it abandoned.
+- API-triggered runs share the API's event loop: a CPU-heavy run would slow API responses (fine for this
+  I/O-bound workload). Gauges are sampled every 0.25 s, so sub-interval spikes can be missed.
 - Signal handling uses `loop.add_signal_handler`, which is Unix-only (Linux/macOS/Docker).
 - A single `httpx.AsyncClient` stops scaling at about 20 connections on this laptop (httpcore pool overhead).
 - GitHub backfills oldest-first at `GITHUB_MAX_PAGES` × 100 issues per repo per run. A primary rate-limit
@@ -239,18 +264,20 @@ from the connector abstraction. The new sources aren't benchmarked yet (Phase 6)
 
 ```
 src/ingest/
-  __main__.py        CLI (migrate, run hn|github|open-meteo|all, replay)
+  __main__.py        CLI (migrate, run hn|github|open-meteo|all, replay, serve)
   config.py          settings from env (one block per source)
   connector.py       the connector contract (Job, Page, Record, Connector protocol)
   connectors/        hn.py, github.py, open_meteo.py, registry.py
   models/            strict schemas: hn.py, github.py, open_meteo.py
-  runner.py          runs sources: per-source clients, sized DB pool, signals
+  runner.py          runs sources: per-source clients, sized DB pool, signals, advisory locks
   pipeline.py        concurrent runner (any connector)
   sequential.py      one-at-a-time runner (baseline)
   records.py         shared per-record rules: retries, rejects, classify, watermarks
   retry.py           backoff with full jitter, Retry-After, rate-limit gate + hook
   shutdown.py        SIGINT/SIGTERM → drain / cancel
   replay.py          dead-letter replay (per source)
+  api.py             FastAPI status/trigger layer
+  observability.py   logging setup, latency percentiles, gauges, live-run registry
   storage.py         items upsert, dead letters, ingestion_runs, watermarks
   httpclient.py      per-source httpx client factory
   db.py, migrate.py  asyncpg pool; migration runner;  migrations/*.sql  the schema

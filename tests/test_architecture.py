@@ -23,6 +23,7 @@ CORE = [
     "httpclient.py",
     "db.py",
     "migrate.py",
+    "observability.py",
 ]
 FORBIDDEN = ("ingest.connectors", "ingest.models")
 
@@ -46,7 +47,7 @@ def test_core_module_imports_no_connector_or_model(module: str) -> None:
 
 def test_every_core_module_is_checked() -> None:
     # A new top-level module must be classified: core (listed above) or wiring (below).
-    wiring = {"__init__.py", "__main__.py", "config.py", "toy_pipeline.py"}
+    wiring = {"__init__.py", "__main__.py", "api.py", "config.py", "toy_pipeline.py"}
     assert {p.name for p in SRC.glob("*.py")} == set(CORE) | wiring
 
 

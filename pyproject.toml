@@ -9,10 +9,12 @@ requires-python = ">=3.12"
 # Runtime deps are added in the phase that first imports them (ADR-0004).
 dependencies = [
     "asyncpg>=0.32.0",
+    "fastapi>=0.143.3",
     "httpx>=0.28.1",
     "pydantic>=2.13.5",
     "pydantic-settings>=2.15.0",
     "structlog>=26.1.0",
+    "uvicorn>=0.54.0",
 ]
 
 # A dependency group (not an optional extra) so plain `uv sync` installs the dev tools.
@@ -23,8 +25,6 @@ dev = [
     "mypy==2.3.1",
     "ruff==0.16.9",
     "respx>=0.23.1",
-    "fastapi>=0.143.3",
-    "uvicorn>=0.54.0",
     "asyncpg-stubs>=0.32.0",
 ]
 

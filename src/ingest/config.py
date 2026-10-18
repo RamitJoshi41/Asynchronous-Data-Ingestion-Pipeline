@@ -6,7 +6,7 @@ CLAUDE.md already fixes the shape of.
 """
 
 from functools import lru_cache
-from typing import Self
+from typing import Literal, Self
 
 from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -54,6 +54,13 @@ class Settings(BaseSettings):
     retry_max_delay_s: float = Field(default=10.0, gt=0)
     retry_after_max_s: float = Field(default=60.0, gt=0)  # longer Retry-After => give up
     shutdown_grace_s: float = Field(default=10.0, gt=0)  # drain deadline after SIGINT/SIGTERM
+
+    # --- Observability + API (Phase 5; ADR-0038, ADR-0039) ----------------------------------
+    log_format: Literal["console", "json"] = "console"  # json for machines, console for humans
+    log_level: Literal["debug", "info", "warning", "error"] = "info"
+    gauge_interval_s: float = Field(default=0.25, gt=0)  # queue depth / in-flight sampling period
+    api_host: str = "127.0.0.1"
+    api_port: int = Field(default=8000, ge=1, le=65535)
 
     # --- Hacker News -----------------------------------------------------------------------
     hn_base_url: str = Field(default="https://hacker-news.firebaseio.com/v0")

@@ -142,3 +142,14 @@ async def test_second_sigint_forces_immediate_exit(
     row, stored = await run_row(schema_settings)
     assert row["status"] == "cancelled" and row["error"] == "forced cancellation"
     assert stored == row["items_inserted"]  # no zombie 'running' row, counts still exact
+
+
+async def test_stop_callbacks_can_unsubscribe() -> None:
+    # The API shares one StopSignal across runs: a finished run must not stay referenced.
+    stop, calls = StopSignal(), []
+    unsubscribe = stop.on_stop(lambda: calls.append("gone"))
+    stop.on_stop(lambda: calls.append("kept"))
+    unsubscribe()
+    unsubscribe()  # idempotent
+    stop.request("SIGTERM")
+    assert calls == ["kept"]

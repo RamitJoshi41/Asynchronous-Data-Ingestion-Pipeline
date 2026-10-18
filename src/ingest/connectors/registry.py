@@ -4,7 +4,7 @@ Each entry builds its connector from Settings and names its own concurrency sett
 Explainer: docs/explain/ingest/connectors/registry.md
 """
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
 from ingest.config import Settings
@@ -12,6 +12,8 @@ from ingest.connector import Connector
 from ingest.connectors.github import GitHubConnector
 from ingest.connectors.hn import HackerNewsConnector
 from ingest.connectors.open_meteo import OpenMeteoConnector
+from ingest.pipeline import PipelineConfig
+from ingest.runner import SourcePlan
 
 
 @dataclass(frozen=True)
@@ -34,3 +36,26 @@ SOURCES: dict[str, SourceSpec] = {
         concurrency=lambda s: s.open_meteo_concurrency,
     ),
 }
+
+
+def build_plans(
+    settings: Settings,
+    names: Sequence[str],
+    *,
+    sequential: bool = False,
+    concurrency: int | None = None,
+    workers: int | None = None,
+    batch_size: int | None = None,
+) -> list[SourcePlan]:
+    """One plan per source: its connector, and its pipeline config (None = sequential)."""
+    plans = []
+    for name in names:
+        spec = SOURCES[name]
+        cfg = PipelineConfig.from_settings(
+            settings,
+            concurrency=spec.concurrency(settings) if concurrency is None else concurrency,
+            workers=workers,
+            batch_size=batch_size,
+        )
+        plans.append(SourcePlan(spec.build(settings), None if sequential else cfg))
+    return plans

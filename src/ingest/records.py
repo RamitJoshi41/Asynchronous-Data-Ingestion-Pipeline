@@ -6,6 +6,7 @@ Explainer: docs/explain/ingest/records.md
 """
 
 import asyncio
+import time
 from collections.abc import AsyncGenerator, Mapping
 from contextlib import aclosing
 
@@ -22,8 +23,9 @@ from ingest.connector import (
     Parsed,
     Record,
 )
+from ingest.observability import LatencyRecorder
 from ingest.retry import Retrier, RetryPolicy, default_rate_limit
-from ingest.storage import DeadLetter, RunCounts, RunStatus, Store
+from ingest.storage import DeadLetter, RunCounts, RunMetrics, RunStatus, Store
 
 type Fetched = Page | DeadLetter  # what a fetcher hands a worker: a page, or an HTTP-level reject
 
@@ -55,13 +57,24 @@ def make_retrier(
 
 
 def fetch_context(
-    client: httpx.AsyncClient, retrier: Retrier, run_log: FilteringBoundLogger
+    client: httpx.AsyncClient,
+    retrier: Retrier,
+    run_log: FilteringBoundLogger,
+    latency: LatencyRecorder | None = None,
 ) -> FetchContext:
-    """The connector's only door to the network: GET with retries and raise_for_status."""
+    """The connector's only door to the network: GET with retries and raise_for_status.
+
+    Every attempt (retries included, failures included) is timed into `latency` (ADR-0038).
+    """
 
     async def get(url: str, params: Mapping[str, str] | None = None) -> httpx.Response:
         async def once() -> httpx.Response:
-            response = await client.get(url, params=params)
+            started = time.perf_counter()
+            try:
+                response = await client.get(url, params=params)
+            finally:
+                if latency is not None:
+                    latency.record(time.perf_counter() - started)
             response.raise_for_status()
             return response
 
@@ -78,13 +91,16 @@ async def finish_safely(
     error: str | None = None,
     *,
     watermarks: Mapping[str, str] | None = None,
+    metrics: RunMetrics | None = None,
 ) -> None:
     """Record the run's final state even while the calling task is being cancelled (ADR-0027).
 
     shield() lets the UPDATE complete if another cancellation arrives mid-await, so a hard
     shutdown can't leave a zombie 'running' row.
     """
-    await asyncio.shield(store.finish_run(run_id, status, counts, error, watermarks=watermarks))
+    await asyncio.shield(
+        store.finish_run(run_id, status, counts, error, watermarks=watermarks, metrics=metrics)
+    )
 
 
 class WatermarkTracker:

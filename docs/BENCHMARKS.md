@@ -15,6 +15,7 @@ recorded hashes map to these published commits:
 | `ef7bab9` | `d02f9c4` | benchmark harness skeleton (Phase 1 results) |
 | `97f0bc9` | `ad43183` | concurrent mode + pool experiment (Phase 2 results) |
 | `95847d9` | the Phase 4 commit (amended to add these results; trees identical: `src` 78dbf77, `benchmarks` a5d1f21) | Phase 4 regression results |
+| `bf844cd` | the Phase 5 commit (amended to add results; `src` tree e924aab identical) | Phase 5 regression result |
 
 ## Methodology
 
@@ -185,6 +186,13 @@ sequential baseline now builds its client with `concurrency=1` (it was the defau
 doesn't matter for one request at a time. GitHub and Open-Meteo aren't benchmarked: their runs are
 quota-bound (GitHub 60 req/h unauthenticated), not throughput-bound. Their real smoke runs (600 issues,
 21 forecast rows, JOURNAL) are functional checks, not measurements.
+
+## Phase 5: regression check with metrics and gauges on (2026-10-18)
+
+Every HTTP attempt is now timed and a sampler task reads queue depth and in-flight every 250 ms. Same
+mock workload, C = 20: repeats 0.637 / 0.655 / 0.620 s, **median 0.637 s** (313.9 items/s), client CPU
+0.21–0.22 s, [json](benchmarks/results/2026-10-18T08-19-07Z_hn_concurrent_c20_mock.json). That's inside
+Phase 4's spread (0.621–0.673 s), so there's no measurable cost.
 
 ## Planned
 

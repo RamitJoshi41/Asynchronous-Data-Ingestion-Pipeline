@@ -3,13 +3,13 @@ from collections.abc import Iterator
 import asyncpg
 import pytest
 import respx
+import structlog
 
 import ingest.httpclient
 import ingest.runner
 from ingest.__main__ import (
     EXIT_CANCELLED,
     EXIT_FAILED,
-    build_plans,
     exit_code,
     main,
     migrate_command,
@@ -17,7 +17,7 @@ from ingest.__main__ import (
     run_command,
 )
 from ingest.config import Settings, get_settings
-from ingest.connectors.registry import SOURCES
+from ingest.connectors.registry import SOURCES, build_plans
 from ingest.db import DbPool, create_pool
 from ingest.runner import SourceOutcome, pool_settings
 from ingest.sequential import RunSummary
@@ -29,12 +29,16 @@ BASE = "https://hn.test/v0"
 @pytest.fixture(autouse=True)
 def fresh_settings_cache() -> Iterator[None]:
     get_settings.cache_clear()
+    logging_config = structlog.get_config()
     yield
     get_settings.cache_clear()
+    # main() configures logging globally: restore the exact previous objects, so loggers other test
+    # modules bound at import time keep seeing capture_logs.
+    structlog.configure(**logging_config)
 
 
 async def test_migrate_command_is_idempotent(schema_settings: Settings) -> None:
-    assert await migrate_command(schema_settings) == [1, 2, 3, 4, 5]
+    assert await migrate_command(schema_settings) == [1, 2, 3, 4, 5, 6]
     assert await migrate_command(schema_settings) == []
 
 
@@ -65,7 +69,7 @@ def test_main_migrate_reads_db_dsn_from_env(
     assert main(["migrate"]) == 0
     assert main(["migrate"]) == 0
     out = capsys.readouterr().out
-    assert "applied migrations: [1, 2, 3, 4, 5]" in out and "schema up to date" in out
+    assert "applied migrations: [1, 2, 3, 4, 5, 6]" in out and "schema up to date" in out
 
 
 @pytest.mark.parametrize("argv", [["run", "hn", "--limit", "0"], ["run", "hn", "--limit", "501"]])
@@ -130,7 +134,7 @@ async def test_concurrency_override_reaches_httpx_limits_and_pool(
 def test_pool_fits_every_source_at_once() -> None:
     base = Settings(_env_file=None)
     plans = build_plans(base, ["github", "hn"], workers=6)
-    assert pool_settings(base, plans).db_pool_max_size == 2 * (6 + 1)
+    assert pool_settings(base, plans).db_pool_max_size == 2 * (6 + 2)  # lock + run row + workers
     sequential = build_plans(base, ["hn"], sequential=True)
     assert pool_settings(base, sequential).db_pool_max_size == base.db_pool_max_size
 

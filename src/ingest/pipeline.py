@@ -16,6 +16,7 @@ Explainer: docs/explain/ingest/pipeline.md   Decisions: ADR-0014..0031
 
 import asyncio
 import time
+from collections.abc import Callable
 from contextlib import aclosing
 from dataclasses import dataclass, field
 from typing import Self
@@ -26,6 +27,7 @@ from structlog.typing import FilteringBoundLogger
 
 from ingest.config import Settings
 from ingest.connector import Connector, FetchContext, Job, Record
+from ingest.observability import GaugeSampler, LatencyRecorder, LiveRun, LiveRuns
 from ingest.records import (
     Fetched,
     WatermarkTracker,
@@ -38,7 +40,7 @@ from ingest.records import (
 from ingest.retry import DEFAULT_POLICY, Retrier, RetryPolicy
 from ingest.sequential import RunSummary
 from ingest.shutdown import StopSignal
-from ingest.storage import DeadLetter, RunCounts, RunStatus, Store
+from ingest.storage import DeadLetter, RunCounts, RunMetrics, RunStatus, Store
 
 log = structlog.get_logger()
 
@@ -106,11 +108,16 @@ async def run_concurrent(
     policy: RetryPolicy = DEFAULT_POLICY,
     stop: StopSignal | None = None,
     drain_timeout_s: float = 10.0,
+    gauge_interval_s: float = 0.25,
+    live: LiveRuns | None = None,
+    on_start: Callable[[str, int], None] | None = None,
 ) -> ConcurrentRunSummary:
     """Concurrent version of run_sequential: same classification, counts and run lifecycle.
 
     Outcomes: `succeeded` (watermarks advanced); `cancelled` (stop requested and drained, drain
     deadline exceeded, or forced cancellation); `failed` (an error survived retries; re-raised).
+    Phase 5: request latency and sampled gauges are stored with the run (ADR-0038); `live` exposes
+    the gauges while it runs, and `on_start(source, run_id)` reports the new run id (API trigger).
     """
     # Re-checked here because configs can be built in code, bypassing Settings validation.
     if store.pool_max_size < cfg.workers + 1:
@@ -123,10 +130,12 @@ async def run_concurrent(
     run_log = log.bind(run_id=run_id, source=source)
     counts, stats, tracker = RunCounts(), PipelineStats(), WatermarkTracker()
     retrier = make_retrier(policy, counts, run_log, connector)
-    ctx = fetch_context(client, retrier, run_log)
+    latency = LatencyRecorder()
+    ctx = fetch_context(client, retrier, run_log, latency)
     stages = _Stages(
-        store, connector, ctx, run_id, cfg, counts, stats, run_log, retrier, tracker, stop
-    )
+        store, connector, ctx, run_id, cfg, counts, stats, run_log, retrier, tracker, stop,
+        gauge_interval_s,
+    )  # fmt: skip
     started = time.perf_counter()
     run_log.info(
         "run_started",
@@ -138,61 +147,97 @@ async def run_concurrent(
     def summary(status: RunStatus) -> ConcurrentRunSummary:
         return ConcurrentRunSummary(run_id, status, counts, time.perf_counter() - started, stats)
 
-    loop = asyncio.get_running_loop()
-    drain: asyncio.Timeout | None = None
-    finished = False
+    def metrics() -> RunMetrics:
+        lat, gauges = latency.summary(), stages.gauges
+        return RunMetrics(
+            duration_ms=round((time.perf_counter() - started) * 1000),
+            requests=lat.requests,
+            latency_p50_ms=lat.p50_ms,
+            latency_p95_ms=lat.p95_ms,
+            latency_max_ms=lat.max_ms,
+            queue_depth_peak=gauges.queue_depth.peak,
+            queue_depth_mean=gauges.queue_depth.mean,
+            in_flight_peak=gauges.in_flight.peak,
+            in_flight_mean=gauges.in_flight.mean,
+        )
 
-    def arm_drain_deadline() -> None:
-        # Called by StopSignal (a loop callback): from now on the drain has a hard deadline.
-        if drain is not None and not finished:
-            run_log.warning("drain_started", deadline_s=drain_timeout_s)
-            drain.reschedule(loop.time() + drain_timeout_s)
-
+    if on_start is not None:
+        on_start(source, run_id)
+    if live is not None:
+        live.add(LiveRun(run_id, source, stages.gauges))
+    unsubscribe: Callable[[], None] = _nothing  # replaced once the drain deadline is armed
     try:
-        jobs = await connector.plan(ctx, await store.watermarks(source))
-        run_log.info("run_planned", jobs=len(jobs))
-        async with asyncio.timeout(None) as drain:
-            if stop is not None:
-                stop.on_stop(arm_drain_deadline)
-            await stages.run(jobs)
-        finished = True
-    except asyncio.CancelledError:
-        # Forced shutdown (second signal): let in-progress flushes land, record, re-raise.
-        finished = True
-        await stages.settle()
-        await finish_safely(store, run_id, RunStatus.CANCELLED, counts, "forced cancellation")
-        run_log.warning("run_cancelled", forced=True, **_count_fields(counts))
-        raise
-    except Exception as exc:  # includes ExceptionGroup from the TaskGroup
-        finished = True
-        await stages.settle()
-        if drain is not None and drain.expired():
-            error = f"drain exceeded {drain_timeout_s}s; remaining work cancelled"
-            await finish_safely(store, run_id, RunStatus.CANCELLED, counts, error)
-            run_log.warning("run_cancelled", drain_timed_out=True, **_count_fields(counts))
-            return summary(RunStatus.CANCELLED)
-        await finish_safely(store, run_id, RunStatus.FAILED, counts, repr(exc))
-        run_log.error("run_failed", error=repr(exc), **_count_fields(counts))
-        raise
-    if stop is not None and stop.is_set():
-        status = RunStatus.CANCELLED  # not every job ran to the end: watermarks stay put
-        await finish_safely(store, run_id, status, counts)
-    else:
-        status = RunStatus.SUCCEEDED
-        await finish_safely(store, run_id, status, counts, watermarks=tracker.advanced())
-    result = summary(status)
-    run_log.info(
-        "run_finished",
-        status=status.value,
-        duration_s=round(result.duration_s, 3),
-        **_count_fields(counts),
-        peak_in_flight=stats.peak_in_flight,
-        peak_raw_queue_depth=stats.peak_raw_queue_depth,
-        blocked_puts=stats.blocked_puts,
-        flushes=stats.flushes,
-        skipped_on_stop=stats.skipped_on_stop,
-    )
-    return result
+        loop = asyncio.get_running_loop()
+        drain: asyncio.Timeout | None = None
+        finished = False
+
+        def arm_drain_deadline() -> None:
+            # Called by StopSignal (a loop callback): from now on the drain has a hard deadline.
+            if drain is not None and not finished:
+                run_log.warning("drain_started", deadline_s=drain_timeout_s)
+                drain.reschedule(loop.time() + drain_timeout_s)
+
+        try:
+            jobs = await connector.plan(ctx, await store.watermarks(source))
+            run_log.info("run_planned", jobs=len(jobs))
+            async with asyncio.timeout(None) as drain:
+                if stop is not None:
+                    unsubscribe = stop.on_stop(arm_drain_deadline)
+                await stages.run(jobs)
+            finished = True
+        except asyncio.CancelledError:
+            # Forced shutdown (second signal): let in-progress flushes land, record, re-raise.
+            finished = True
+            await stages.settle()
+            await finish_safely(
+                store, run_id, RunStatus.CANCELLED, counts, "forced cancellation", metrics=metrics()
+            )
+            run_log.warning("run_cancelled", forced=True, **_count_fields(counts))
+            raise
+        except Exception as exc:  # includes ExceptionGroup from the TaskGroup
+            finished = True
+            await stages.settle()
+            if drain is not None and drain.expired():
+                error = f"drain exceeded {drain_timeout_s}s; remaining work cancelled"
+                await finish_safely(
+                    store, run_id, RunStatus.CANCELLED, counts, error, metrics=metrics()
+                )
+                run_log.warning("run_cancelled", drain_timed_out=True, **_count_fields(counts))
+                return summary(RunStatus.CANCELLED)
+            await finish_safely(
+                store, run_id, RunStatus.FAILED, counts, repr(exc), metrics=metrics()
+            )
+            run_log.error("run_failed", error=repr(exc), **_count_fields(counts))
+            raise
+        if stop is not None and stop.is_set():
+            status = RunStatus.CANCELLED  # not every job ran to the end: watermarks stay put
+            await finish_safely(store, run_id, status, counts, metrics=metrics())
+        else:
+            status = RunStatus.SUCCEEDED
+            await finish_safely(
+                store, run_id, status, counts, watermarks=tracker.advanced(), metrics=metrics()
+            )
+        result = summary(status)
+        run_log.info(
+            "run_finished",
+            status=status.value,
+            duration_s=round(result.duration_s, 3),
+            **_count_fields(counts),
+            peak_in_flight=stats.peak_in_flight,
+            peak_raw_queue_depth=stats.peak_raw_queue_depth,
+            blocked_puts=stats.blocked_puts,
+            flushes=stats.flushes,
+            skipped_on_stop=stats.skipped_on_stop,
+        )
+        return result
+    finally:
+        unsubscribe()
+        if live is not None:
+            live.remove(run_id)
+
+
+def _nothing() -> None:
+    return None
 
 
 def _count_fields(counts: RunCounts) -> dict[str, int]:
@@ -223,6 +268,7 @@ class _Stages:
         retrier: Retrier,
         tracker: WatermarkTracker,
         stop: StopSignal | None,
+        gauge_interval_s: float = 0.25,
     ) -> None:
         self._store, self._connector, self._ctx = store, connector, ctx
         self._run_id, self._cfg = run_id, cfg
@@ -233,16 +279,25 @@ class _Stages:
         self._raw: asyncio.Queue[Fetched | None] = asyncio.Queue(cfg.raw_queue_maxsize)
         # Flush tasks in progress. They outlive a cancelled worker on purpose (see _flush).
         self._inflight: set[asyncio.Task[None]] = set()
+        # The raw queue is where backpressure shows; in-flight = page requests being awaited.
+        self.gauges = GaugeSampler(
+            self._raw.qsize, lambda: self._stats.in_flight, interval_s=gauge_interval_s
+        )
 
     def _stopping(self) -> bool:
         return self._stop is not None and self._stop.is_set()
 
     async def run(self, jobs: list[Job]) -> None:
-        async with asyncio.TaskGroup() as tg:
-            tg.create_task(self._feed(jobs), name="feeder")
-            tg.create_task(self._fetch_stage(), name="fetch-stage")
-            for worker_id in range(self._cfg.workers):
-                tg.create_task(self._worker(worker_id), name=f"worker-{worker_id}")
+        async with asyncio.TaskGroup() as outer:
+            outer.create_task(self.gauges.run(), name="gauges")
+            try:
+                async with asyncio.TaskGroup() as tg:
+                    tg.create_task(self._feed(jobs), name="feeder")
+                    tg.create_task(self._fetch_stage(), name="fetch-stage")
+                    for worker_id in range(self._cfg.workers):
+                        tg.create_task(self._worker(worker_id), name=f"worker-{worker_id}")
+            finally:
+                self.gauges.stop()  # the sampler returns; on errors `outer` cancels it anyway
 
     async def settle(self) -> None:
         """Wait for flushes that were mid-write when the run was cancelled or failed (ADR-0027)."""
