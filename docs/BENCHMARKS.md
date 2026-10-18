@@ -16,7 +16,8 @@ recorded hashes map to these published commits:
 | `97f0bc9` | `ad43183` | concurrent mode + pool experiment (Phase 2 results) |
 | `95847d9` | the Phase 4 commit (amended to add these results; trees identical: `src` 78dbf77, `benchmarks` a5d1f21) | Phase 4 regression results |
 | `bf844cd` | the Phase 5 commit (amended to add results; `src` tree e924aab identical) | Phase 5 regression result |
-| `1f14b12` | the Phase 6 commit (amended to add results and README; `src`/`benchmarks` trees identical) | Phase 6 final matrix |
+| `1f14b12` | the Phase 6 commit (amended to add results and README; `src`/`benchmarks` trees identical) | Phase 6 matrix, battery |
+| `fa8852b` | the published Phase 6 commit (results added in the next commit, `bench: phase 6 final matrix on AC power`) | Phase 6 matrix, AC (final) |
 
 ## Methodology
 
@@ -195,10 +196,34 @@ mock workload, C = 20: repeats 0.637 / 0.655 / 0.620 s, **median 0.637 s** (313.
 0.21–0.22 s, [json](benchmarks/results/2026-10-18T08-19-07Z_hn_concurrent_c20_mock.json). That's inside
 Phase 4's spread (0.621–0.673 s), so there's no measurable cost.
 
-## Phase 6: final matrix (2026-10-18)
+## Phase 6: final matrix on AC power (2026-10-18)
 
-Measured at commit `1f14b12` (clean tree), mock with 50 ms latency, 200 items, 3 repeats, medians; plus one
-small real-API run. **Machine state: on battery, `powersave` governor, CPU at ~2.7 of 4.5 GHz** (read from
+Same code as the battery run below (measured at `fa8852b`, whose `src`/`benchmarks` trees equal `1f14b12`'s), re-run
+**plugged in** (cores boosting to ~3.9–4.1 GHz). This is the headline table.
+
+| Mode | Repeats (s) | Median | Throughput | Speedup | Client CPU (s) | Error rate | Raw |
+|---|---|---|---|---|---|---|---|
+| sequential | 11.469 / 11.195 / 10.917 | **11.195 s** | 17.9 items/s | 1.0× | 0.39–0.68 | 0.0 | [json](benchmarks/results/2026-10-18T09-21-52Z_hn_sequential_mock.json) |
+| concurrent C = 5 | 2.218 / 2.183 / 2.215 | **2.215 s** | 90.3 items/s | **5.1×** | 0.21–0.25 | 0.0 | [json](benchmarks/results/2026-10-18T09-22-26Z_hn_concurrent_c5_mock.json) |
+| concurrent C = 20 | 0.651 / 0.650 / 0.629 | **0.650 s** | 307.6 items/s | **17.2×** | 0.22–0.24 | 0.0 | [json](benchmarks/results/2026-10-18T09-22-34Z_hn_concurrent_c20_mock.json) |
+| concurrent C = 50 | 1.009 / 1.057 / 0.976 | **1.009 s** | 198.3 items/s | 11.1× | 0.86–0.94 | 0.0 | [json](benchmarks/results/2026-10-18T09-22-37Z_hn_concurrent_c50_mock.json) |
+| real HN API, C = 5 | 3.878 (1 run) | 3.878 s | 7.74 items/s | | 0.07 | 0.0 | [json](benchmarks/results/2026-10-18T09-22-41Z_hn_concurrent_c5_real.json) |
+
+**Reading the numbers**
+- Up to C = 20 the results match Phase 2 (5.1× and 17.2× vs 5.1× and 17.6×): the reliability, connector and
+  metrics layers cost nothing measurable while the run is I/O-bound.
+- **C = 50 is slower than in Phase 2** (1.009 s vs 0.826 s; client CPU ~0.9 s vs 0.71 s). C = 50 is the
+  CPU-bound regime (profiled in Phase 2), and it wasn't re-measured in Phases 3–5. The likely cause is the
+  per-request work added since then (retry wrapper, per-attempt latency timing, async-generator pages,
+  gauge sampling), which only shows once the client is CPU-bound. That's an inference, not profiled. C = 20
+  remains the sweet spot.
+- Battery vs AC (same code): C = 20 0.700 → 0.650 s, C = 50 1.409 → 1.009 s. Power state matters most in
+  the CPU-bound case. Lesson: record power state with every benchmark.
+
+### Same matrix on battery (kept for the record)
+
+
+Measured at commit `1f14b12` (clean tree), same parameters. **Machine state: on battery, `powersave` governor, CPU at ~2.7 of 4.5 GHz** (read from
 `/sys` right after the run). Earlier phases didn't record power state.
 
 | Mode | Repeats (s) | Median | Throughput | Speedup | Client CPU (s) | Error rate | Raw |

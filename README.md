@@ -160,28 +160,28 @@ job that brings up `docker compose` and checks `/health`. Important guarantees w
 
 ## Benchmarks
 
-Local mock HN server with 50 ms injected latency, 200 items, 3 repeats, medians, i5-11400H laptop
-([methodology, raw JSON, caveats](docs/BENCHMARKS.md)). Two measurements of the same matrix:
+Local mock HN server with 50 ms injected latency, 200 items, 3 repeats, medians, i5-11400H laptop on AC
+power ([methodology, raw JSON, caveats](docs/BENCHMARKS.md)):
 
-| Mode | Phase 2 (2026-10-17) | Final, Phase 6 (2026-10-18, **on battery**) | Error rate |
+| Mode | Phase 2 (first concurrent version) | Final (Phase 6, all features) | Error rate |
 |---|---|---|---|
-| sequential | 11.577 s · 17.3 items/s | 11.616 s · 17.2 items/s | 0 |
-| concurrent, C = 5 | 2.279 s · **5.1×** | 2.350 s · **4.9×** | 0 |
-| concurrent, C = 20 | 0.658 s · **17.6×** | 0.700 s · **16.6×** | 0 |
-| concurrent, C = 50 | 0.826 s · 14.0× | 1.409 s · 8.2× | 0 |
+| sequential | 11.577 s · 17.3 items/s | 11.195 s · 17.9 items/s | 0 |
+| concurrent, C = 5 | 2.279 s · **5.1×** | 2.215 s · **5.1×** | 0 |
+| concurrent, C = 20 | 0.658 s · **17.6×** | 0.650 s · **17.2×** | 0 |
+| concurrent, C = 50 | 0.826 s · 14.0× | 1.009 s · 11.1× | 0 |
 
-C = 50 is *slower* than C = 20 in both: the client becomes CPU-bound in httpcore's connection-pool
-bookkeeping (O(connections²) per request event, found by profiling). The final run was on battery
-(`powersave`, ~2.7 of 4.5 GHz), which roughly doubled client CPU time and hit the CPU-bound C = 50 case
-hardest. Between them, each phase re-measured C = 20 to show its features cost nothing measurable
-(0.630 / 0.627–0.651 / 0.637 s).
+C = 50 is *slower* than C = 20: the client becomes CPU-bound in httpcore's connection-pool bookkeeping
+(O(connections²) per request event, found by profiling). In that CPU-bound regime the per-request work added
+by later phases (retries, latency timing, gauges) also shows up (0.83 → 1.01 s). That's a likely cause, not
+profiled. While I/O-bound (C ≤ 20), the added layers cost nothing measurable. A run on battery (same code)
+was markedly slower at C = 50 (1.41 s): power state matters in the CPU-bound case.
 
 **Under injected faults** (10% 500s, 1% 429 with `Retry-After: 1`, C = 20): without retries every
 run failed; with a 4-attempt budget, 2 of 3 runs ingested all 200 items (24–27 retries, 2.3–4.2 s),
 and one failed when a single item hit four 500s in a row (≈3% expected per run at this fault rate).
 
 Real HN API, one run each: sequential 30 items in 12.762 s vs concurrent C = 5 in 3.931 s (Phase 2) and
-4.229 s (Phase 6). Internet timing on different days, so indicative only. Mock numbers describe this laptop with a fixed artificial delay.
+3.878 s (Phase 6). Internet timing on different days, so indicative only. Mock numbers describe this laptop with a fixed artificial delay.
 
 After the Phase 4 refactor the sequential baseline measured 11.304 s (17.7 items/s): no measurable cost
 from the connector abstraction. The new sources aren't benchmarked yet (Phase 6).
